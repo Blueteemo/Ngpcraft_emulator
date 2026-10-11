@@ -4873,8 +4873,11 @@ class PlayPage(QWidget):
         # consoles, pumped by the session rather than by _pump_link. Without this the
         # Link tab would read zero bytes on a cable that is busy -- and a debug tool
         # that reads zero on a working link is worse than no tool.
+        #
+        # ⛔ COUNTS ONLY, never `monitor_a`: a monitor switches how the pair is stepped,
+        # on this PC alone, and the two PCs drift (core.link.run_two_consoles_interleaved).
         if self._mirror is not None:
-            self._mirror.link.monitor_a = monitor
+            self._mirror.link.observer_a = monitor
 
     def link_mode(self) -> str:
         """Which cable, if any, this console is on -- for the debugger to show."""
@@ -6871,6 +6874,9 @@ class Shell(QMainWindow):
         page.watches.rearm()
         page.apply_debug()
         link = InProcessLink(page.machine, peer.machine)
+        # A tap already armed before the match (debugger open) counts this cable too:
+        # the debugger only re-hands it over when the monitor CHANGES.
+        link.observer_a = page.link_monitor
         session = MirrorSession(page.machine, peer.machine, link, pipe, hs, prime)
         page.attach_mirror(session, peer)
         self._net_status = QTimer(self)

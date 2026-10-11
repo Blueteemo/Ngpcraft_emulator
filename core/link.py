@@ -136,7 +136,29 @@ def run_two_consoles_interleaved(first, second, link) -> None:
 
     Machines without the sliced `run` interface (test doubles) fall back to a whole
     frame each, which is what this code did everywhere before.
+
+    ⚡ `link.observer_a`, when set, is a LinkMonitor that only COUNTS -- the debugger's
+    tap on a mirror cable. It is read around the frame, never consulted to pick the
+    path below.
+
+    ⛔ WHY NOT `monitor_a`. A monitor sends the pair down the host relay, and in mirror
+    play only ONE PC has the debugger open: that PC steps the cable differently from
+    the other, and the two drift. Measured on the probe ROM, four consoles: the RAM
+    parted company on the very frame the tap went in, checksum desync 90 frames later
+    -- and the debugger attaches its tap just by refreshing the Link tab. Found by
+    Blueteemo (Tixul/Ngpcraft_emulator PR #26), whose fix refused the match instead.
     """
+    observer = getattr(link, "observer_a", None)
+    if observer is None:
+        _advance_pair(first, second, link)
+        return
+    ab, ba = getattr(link, "bytes_ab", 0), getattr(link, "bytes_ba", 0)
+    _advance_pair(first, second, link)
+    observer.on_counted(getattr(link, "bytes_ab", 0) - ab,
+                        getattr(link, "bytes_ba", 0) - ba)
+
+
+def _advance_pair(first, second, link) -> None:
     if not hasattr(first, "run") or not hasattr(second, "run"):
         first.run_frames(1)
         link.pump()
@@ -216,6 +238,9 @@ class InProcessLink:
         # wire nobody is looking at, which is the normal case.
         self.monitor_a = monitor_a
         self.monitor_b = monitor_b
+        # A count-only tap, for a cable that must not be touched (mirror play; see
+        # run_two_consoles_interleaved). Read by that function, not by pump().
+        self.observer_a = None
         self.a.serial_set_enabled(True)
         self.b.serial_set_enabled(True)
         self.bytes_ab = 0

@@ -365,7 +365,13 @@ class Handshake:
             them = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return "unreadable_hello"
-        if int(them.get("v", -1)) != PROTOCOL_VERSION:
+        # ⛔ A HELLO IS WHATEVER THE WIRE SAYS IT IS. Valid JSON that is not an object
+        # (a list, a bare number) crashed `.get` below; `int()` accepted "3", 3.9 and
+        # True -- and threw on None or "x". Refuse by name rather than raise.
+        # (Reported by Blueteemo, Tixul/Ngpcraft_emulator PR #26.)
+        if not isinstance(them, dict):
+            return "unreadable_hello"
+        if type(them.get("v")) is not int or them["v"] != PROTOCOL_VERSION:
             return "protocol_version"
         self.peer_rom_hash = them.get("rom")     # what their image must hash to
         cons = them.get("cons")
@@ -397,8 +403,8 @@ class Handshake:
         # refusing is the version that cannot be subtly wrong. The session sends its
         # own hello with whatever it settled on, so a joiner that failed to adopt is
         # caught there, loudly, instead of drifting.
-        peer_delay = int(them.get("delay", -1))
-        if peer_delay < 0:
+        peer_delay = them.get("delay")
+        if type(peer_delay) is not int or peer_delay < 0:
             return "input_delay"
         if peer_delay != self.delay:
             if self.locked:

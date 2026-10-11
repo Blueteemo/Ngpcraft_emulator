@@ -4238,6 +4238,11 @@ class DebugWindow(QMainWindow):
         mon = self._link_tap()
         if mon is None:
             self._status.setText("no game running"); return
+        play = self._play
+        if hasattr(play, "link_mode") and play.link_mode() == "mirror":
+            # A byte the other PC's copy of this console never receives is a desync.
+            self._status.setText("mirror match: injection is off (the other PC would desync)")
+            return
         text = self._link_inject.text().strip()
         if not text:
             return
@@ -4395,6 +4400,10 @@ class DebugWindow(QMainWindow):
             broken = (f"   [impaired: {imp.delay_frames} fr latency, "
                       f"{imp.drop * 100:.0f}% loss{', CUT' if imp.cut else ''}]"
                       if imp.active else "")
+            if mon.counts_only:
+                # Mirror play: the core relays this cable and reports counts, not
+                # bytes -- and impairing one PC's copy would desync the other.
+                broken = "   [mirror: counters only -- no log, impairment or injection]"
             lines[2] = (f"tapped traffic   TX {mon.bytes_tx} B ({rate_tx:.0f} B/s)   "
                         f"RX {mon.bytes_rx} B ({rate_rx:.0f} B/s)   "
                         f"dropped {mon.bytes_dropped}   injected {mon.bytes_injected}{broken}")

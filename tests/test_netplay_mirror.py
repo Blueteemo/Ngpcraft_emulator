@@ -1143,14 +1143,18 @@ def test_the_debugger_tap_reaches_the_mirror_cable(sh, app):
         _bring_up(sh, s2, sh.play.session._rom)
         mon = LinkMonitor()
         sh.play.set_link_monitor(mon)
-        assert sh.play._mirror.link.monitor_a is mon, "the tap never reached the cable"
+        # ⛔ As a COUNTER, not as `monitor_a`: a monitor reroutes how this PC steps the
+        # pair, and the other PC does not follow (see the four-console test below).
+        assert sh.play._mirror.link.observer_a is mon, "the tap never reached the cable"
+        assert sh.play._mirror.link.monitor_a is None, "the tap rerouted the cable"
 
         far = sh.play._mirror
         for f in range(200):                     # feed it the peer's inputs by hand
             far.peer_inputs[f] = 0x01
             sh.play._tick()
         assert mon.bytes_tx > 0, "the tap saw nothing on a cable that carried bytes"
-        assert mon.raw(TX), "no transmit log"
+        assert mon.bytes_rx > 0, "the tap saw nothing coming back"
+        assert mon.counts_only and not mon.raw(TX), "the core relay has no bytes to log"
     finally:
         if sh._net_status is not None:
             sh._net_status.stop(); sh._net_status = None
@@ -1478,3 +1482,65 @@ def test_a_peer_from_before_the_measurement_is_refused_not_misread():
     vieux = json.loads(a.payload().decode())
     vieux["v"] = netplay.PROTOCOL_VERSION - 1
     assert a.check(json.dumps(vieux).encode()) == "protocol_version"
+
+
+def test_a_malformed_hello_is_refused_by_name_not_raised():
+    """⛔ The hello is whatever the wire says. Valid JSON that is not an object crashed
+    `.get`; `int()` let "3" and True through as a version and threw on None. Each is
+    a refusal with a reason, never an exception in the frame loop.
+    (Reported by Blueteemo, Tixul/Ngpcraft_emulator PR #26.)"""
+    import json
+    a = Handshake(rom_hash="r", bios_hash="b", core_version="c")
+    good = json.loads(a.payload().decode())
+    assert a.check(json.dumps(good).encode()) is None
+    for raw in ([1, 2], 3, "hello", None):
+        assert a.check(json.dumps(raw).encode()) == "unreadable_hello", raw
+    for v in (str(netplay.PROTOCOL_VERSION), float(netplay.PROTOCOL_VERSION), True, None):
+        bad = dict(good, v=v)
+        assert a.check(json.dumps(bad).encode()) == "protocol_version", v
+    for d in ("3", 3.0, None, -1, True):
+        bad = dict(good, delay=d)
+        assert a.check(json.dumps(bad).encode()) == "input_delay", d
+
+
+@pytest.mark.skipif(not (BIOS.exists() and ROM.exists()),
+                    reason="needs the retail bios.bin (gitignored) and the probe ROM")
+def test_opening_the_debugger_on_ONE_pc_mid_match_does_not_desync_the_other():
+    """⛔ THE DESYNC THIS PINS. A link monitor sent the pair down the host relay, and in
+    mirror play only one PC has the debugger open -- the Link tab arms its tap just by
+    refreshing. That PC then stepped the cable differently from the other: measured
+    here, four consoles, the RAM parted company on the very frame the tap went in.
+    The tap is now a counter (InProcessLink.observer_a) and must leave the two PCs
+    byte-identical. Found by Blueteemo (Tixul/Ngpcraft_emulator PR #26)."""
+    from core import native
+    from core.link import InProcessLink
+    from core.link_debug import LinkMonitor
+
+    rom, bios = ROM.read_bytes(), BIOS.read_bytes()
+
+    def one_pc(pipe, host):
+        local = native.NativeMachine(rom, bios=bios)
+        peer = native.NativeMachine(rom, bios=bios)
+        local.reset(bios_handoff=True)
+        peer.reset(bios_handoff=True)
+        return MirrorSession(local, peer, InProcessLink(local, peer), pipe,
+                             Handshake(rom_hash="r", bios_hash="b", core_version="c",
+                                       delay=4, host=host))
+
+    pa, pb = ListPipe.pair(0)
+    pc1, pc2 = one_pc(pa, True), one_pc(pb, False)
+    mon = LinkMonitor()
+    try:
+        for i in range(300):
+            if i == 30:
+                pc1.link.observer_a = mon          # what Shell.set_link_monitor does
+            assert pc1.step(0x08) == "ran" and pc2.step(0x01) == "ran"
+            assert pc1.local.read(0x4000, 0x2C00) == pc2.peer.read(0x4000, 0x2C00), \
+                f"player 1's console differs between the two PCs at frame {i}"
+            assert pc1.peer.read(0x4000, 0x2C00) == pc2.local.read(0x4000, 0x2C00), \
+                f"player 2's console differs between the two PCs at frame {i}"
+        assert pc1.desync_at is None and pc2.desync_at is None
+        assert mon.bytes_tx > 0 and mon.bytes_rx > 0, "the counter saw nothing"
+    finally:
+        for s in (pc1, pc2):
+            s.local.close(); s.peer.close()

@@ -94,6 +94,9 @@ class LinkMonitor:
         self._held: deque[tuple[int, int]] = deque()   # (release_frame, byte)
         self._inject = bytearray()
         self._rng = random.Random(seed)
+        # True once a relay has only COUNTED for this monitor (on_counted): the log,
+        # the impairment and the injection are then not reaching the cable.
+        self.counts_only = False
 
     # --- what the relay calls ----------------------------------------------
     def on_tx(self, data: bytes) -> bytes:
@@ -104,6 +107,7 @@ class LinkMonitor:
         whose delay has expired -- order preserved, because every byte waits the
         same number of frames.
         """
+        self.counts_only = False        # a real relay again (the monitor outlives relinks)
         if data:
             self.log.append(LinkEvent(self.frame, TX, bytes(data)))
             self.bytes_tx += len(data)
@@ -136,6 +140,15 @@ class LinkMonitor:
         if data:
             self.log.append(LinkEvent(self.frame, RX, bytes(data)))
             self.bytes_rx += len(data)
+
+    def on_counted(self, tx: int, rx: int) -> None:
+        """Count bytes a relay moved WITHOUT handing them over: no log, no impairment,
+        no injection. What a mirror session gives the monitor (see
+        core.link.run_two_consoles_interleaved) -- its cable is relayed inside the core,
+        which reports how many bytes crossed but not which."""
+        self.counts_only = True
+        self.bytes_tx += tx
+        self.bytes_rx += rx
 
     def take_injected(self) -> bytes:
         """Bytes the user asked to send to the local machine, if any."""
