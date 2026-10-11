@@ -23,9 +23,13 @@ is a feature you can run yourself — see [ROM analysis](#rom-analysis).
 | --- | --- |
 | Desktop | Python/Qt application described below; standalone builds in [Releases](https://github.com/Tixul/Ngpcraft_emulator/releases). |
 | Libretro 0.4 | [RetroArch core](libretro/README.md), with sources and a [Windows x64 prebuilt](libretro/prebuilt/windows-x86_64/). Compiles the same `cpp/` sources and `hle_bios/` firmware as the desktop. |
-| Android 1.1 | [Native Android application](android/README.md), Android 7.0+, universal signed APK. Prepared for manual publication in Releases. |
+| Android 1.3 | [Native Android application](android/README.md), Android 7.0+, universal signed APK. Can be launched from frontends such as ES-DE and Daijishō. Prepared for manual publication in Releases. |
 
-The Android 1.1 and Libretro 0.4 update includes the desktop flash timing model and current clean-room HLE BIOS. Android sources are maintained separately; this repository contains its installation notes, while APKs are distributed as release assets.
+Android sources are maintained separately; this repository contains its installation notes, while APKs are distributed as release assets. Android and Libretro use the same emulation core and clean-room HLE BIOS as the desktop.
+
+**Android and frontends.** Since 1.3 the app is `io.github.tixul.ngpcraft`, and frontends launch `io.github.tixul.ngpcraft/.MainActivity`. It accepts the game as a `content://` URI or a path, with or without `android.intent.action.VIEW`, or as the RetroArch-style `ROM` extra. Quitting the game returns to the frontend. A plain path is read through the ROM folder chosen in the app, which does not ask for access to all files. Ready-made commands for Daijishō and ES-DE are in [android/README.md](android/README.md#launching-from-a-frontend-es-de-daijishō).
+
+⚠️ 1.3 has a new package name, so Android installs it next to 1.2 instead of updating it, and 1.2's saves do not carry over.
 
 ## Features
 
