@@ -474,12 +474,13 @@ def _required_xx_size(first_opcode: int) -> int | None:
 def _prefixed_register_info(first_opcode: int) -> tuple[str, str, str | None] | None:
     if 0xC8 <= first_opcode <= 0xCF:
         return ("byte", R8[first_opcode & 0x07], None)
-    if 0xD0 <= first_opcode <= 0xD7:
-        return (
-            "word",
-            R16[first_opcode & 0x07],
-            "!BROKEN D0..D7 ALU word-register prefix on NGPC silicon",
-        )
+    # 0xD0..0xD7 is NOT a register prefix: it is the WORD MEMORY-addressing family
+    # (abs8/abs16/abs24/secondary/-r/r+), HW-confirmed 2026-07-03 (hw_test_d0). The
+    # executor dropped this row on 2026-07-12 (G3, Pac-Man); the decoder kept it, so
+    # every D0..D7 memory form a specialised decoder did not claim fell through to
+    # here and came out as a REGISTER instruction of the wrong length
+    # (`D2 nn nn nn 88` = `add (#24),WA` decoded as `dec 2,DE`). Removed 2026-10-16;
+    # the source-memory group is now decoded by `_decode_source_memory_generic`.
     if 0xD8 <= first_opcode <= 0xDF:
         # WORD (16-bit), NOT long. Ground truth: ngdis masker.h getzz(0xD8)=1=word
         # (the genuine long prefix is 0xE8..0xEF, getzz=2). HW-CONFIRMED 2026-07-03
@@ -3384,7 +3385,7 @@ def _unknown_result(pc: int, raw_bytes: bytes, note: str) -> DecodeResult:
     )
 
 
-def decode_instruction_at(bus: NgpcReadBus, pc: int) -> DecodeResult:
+def _decode_instruction_at_legacy(bus: NgpcReadBus, pc: int) -> DecodeResult:
     """Decode one instruction at an explicit address using the minimal supported subset."""
     first_byte, failure_status = _read_prefix(bus, pc, 1)
     if failure_status is not None:
@@ -4131,3 +4132,212 @@ def decode_instruction_at(bus: NgpcReadBus, pc: int) -> DecodeResult:
 def decode_next_instruction(view: NgpcFetchView) -> DecodeResult:
     """Decode one instruction at the current machine PC."""
     return decode_instruction_at(view.bus, view.machine.cpu.pc)
+
+
+# ---------------------------------------------------------------------------
+# SOURCE-MEMORY GROUP: one decoder for every size and every addressing mode.
+# ---------------------------------------------------------------------------
+# specs/TLCS900_MEMORY_FAMILY.md §1-§3 (encodings ranked by asm900). First byte
+# 0x80..0xAF (modes 0..15) or 0xC0..0xC5 / 0xD0..0xD5 / 0xE0..0xE5 (modes 16..21),
+# zz = byte / word / long; the sub-opcode follows the mode's operand bytes.
+#
+# WHY IT EXISTS. This core grew one decoder per (prefix, mode, sub-op) cell, and
+# a cell nobody wrote fell through to whatever matched next. Checked 2026-10-16
+# against 930 encodings produced by the official assembler (3 sizes x 10 modes x
+# every source sub-op): 201 decoded at the WRONG LENGTH -- `D0 nn 80`
+# (`add WA,(#8)`) came out as `add WA,WA`, `D2 nn nn nn 88` (`add (#24),WA`) as
+# `dec 2,DE` -- and `C2 nn nn nn 41` (`mul WA,(#24)`) decoded at the right
+# length as a STORE. A wrong length desynchronises every instruction after it.
+#
+# This decoder is authoritative for LENGTH and OPERATION. The specialised
+# decoders are kept for their display text when they agree with it.
+
+_SRC_ALU = ("add", "adc", "sub", "sbc", "and", "xor", "or", "cp")
+_SRC_SHIFT = ("rlc", "rrc", "rl", "rr", "sla", "sra", "sll", "srl")
+_SRC_BLOCK = {0x10: "ldi", 0x11: "ldir", 0x12: "ldd", 0x13: "lddr",
+              0x14: "cpi", 0x15: "cpir", 0x16: "cpd", 0x17: "cpdr"}
+_SRC_MULDIV = ("mul", "muls", "div", "divs")
+_SRC_BASE_MNEMONICS = frozenset(
+    _SRC_ALU + _SRC_SHIFT + tuple(_SRC_BLOCK.values()) + _SRC_MULDIV
+    + ("ld", "ex", "push", "inc", "dec", "rld", "rrd")
+)
+
+
+def is_source_memory_prefix(first: int) -> bool:
+    """First byte of a source-memory instruction (spec §1)."""
+    if 0x80 <= first <= 0xAF:
+        return True
+    return first in range(0xC0, 0xF0) and (first & 0x0F) <= 0x05
+
+
+def source_memory_size_kind(first: int) -> str:
+    zz = (first >> 4) & 0x03 if first < 0xC0 else (first >> 4) - 0x0C
+    return ("byte", "word", "long")[zz]
+
+
+def _rcode_r32_display(code: int) -> str:
+    """32-bit register named by an extended register code (low 2 bits ignored)."""
+    rcode = code & 0xFC
+    if rcode >= 0xE0:
+        return R32[(rcode >> 2) & 0x07]
+    if rcode >= 0xD0:
+        return R32[(rcode >> 2) & 0x03] + "'"
+    if rcode < 0x40:
+        return f"{R32[(rcode & 0x0F) >> 2]}{rcode >> 4}"
+    return f"r32?0x{code:02X}"
+
+
+def _rcode_r16_display(code: int) -> str:
+    if code >= 0xE0 and (code & 0x03) in (0, 2):
+        name = R16[(code >> 2) & 0x07]
+        return name if (code & 0x03) == 0 else "Q" + name
+    return f"r16?0x{code:02X}"
+
+
+def source_memory_mode(data: bytes) -> tuple[int, str] | None:
+    """(operand length incl. the first byte, display text) of the addressing mode.
+
+    Returns None when the bytes do not name a defined mode -- the caller must not
+    guess a length then.
+    """
+    first = data[0]
+    mm = ((first & 0x40) >> 2) | (first & 0x0F)
+    if mm <= 7:
+        return 1, f"({R32[mm]})"
+    if mm <= 15:
+        if len(data) < 2:
+            return None
+        d = _s8(data[1])
+        return 2, f"({R32[mm - 8]}{d:+d})"
+    if mm == 16:
+        return (2, f"(0x{data[1]:02X})") if len(data) >= 2 else None
+    if mm == 17:
+        return (3, f"(0x{_u16(data, 1):04X})") if len(data) >= 3 else None
+    if mm == 18:
+        if len(data) < 4:
+            return None
+        return 4, f"(0x{int.from_bytes(data[1:4], 'little'):06X})"
+    if mm == 19:
+        if len(data) < 2:
+            return None
+        sec = data[1]
+        if sec in (0x03, 0x07):
+            if len(data) < 4:
+                return None
+            index = (C7_REGISTER_NAMES[data[3]] if sec == 0x03
+                     else _rcode_r16_display(data[3]))
+            return 4, f"({_rcode_r32_display(data[2])}+{index})"
+        if sec == 0x13:
+            return None          # pc-relative: LDAR only (destination group)
+        if (sec & 0x03) == 0x01:
+            if len(data) < 4:
+                return None
+            return 4, f"({_rcode_r32_display(sec)}{_s16(data, 2):+d})"
+        if (sec & 0x03) == 0x00:
+            return 2, f"({_rcode_r32_display(sec)})"
+        return None
+    if mm in (20, 21):
+        if len(data) < 2 or (data[1] & 0x03) == 0x03:
+            return None          # step 3 is undefined (spec §6, trap 7)
+        name = _rcode_r32_display(data[1])
+        return 2, (f"(-{name})" if mm == 20 else f"({name}+)")
+    return None
+
+
+def _decode_source_memory_generic(data: bytes) -> _DecodedInstruction | None:
+    """Decode a source-memory instruction from `data` (up to 8 bytes)."""
+    if not data or not is_source_memory_prefix(data[0]):
+        return None
+    mode = source_memory_mode(data)
+    if mode is None:
+        return None
+    mlen, mem = mode
+    if len(data) <= mlen:
+        return None
+    size_kind = source_memory_size_kind(data[0])
+    zz = ("byte", "word", "long").index(size_kind)
+    suffix = ("b", "w", "")[zz]
+    regs = (R8, R16, R32)[zz]
+    sub = data[mlen]
+    r = sub & 0x07
+    mm = ((data[0] & 0x40) >> 2) | (data[0] & 0x0F)
+
+    def done(mnemonic: str, operands: str, extra: int = 0) -> _DecodedInstruction | None:
+        length = mlen + 1 + extra
+        if len(data) < length:
+            return None
+        return _DecodedInstruction(length=length, mnemonic=mnemonic, operands=operands)
+
+    if sub == 0x04 and zz < 2:
+        return done("push" + suffix, mem)
+    if sub in (0x06, 0x07) and zz == 0:
+        return done("rld" if sub == 0x06 else "rrd", f"A, {mem}")
+    if sub in _SRC_BLOCK and zz < 2 and mm <= 7:
+        return done(_SRC_BLOCK[sub] + suffix, "")
+    if sub == 0x19 and zz < 2:
+        if len(data) < mlen + 3:
+            return None
+        return done("ld" + suffix, f"(0x{_u16(data, mlen + 1):04X}), {mem}", 2)
+    if 0x20 <= sub <= 0x27:
+        return done("ld", f"{regs[r]}, {mem}")
+    if 0x30 <= sub <= 0x37 and zz < 2:
+        return done("ex", f"{mem}, {regs[r]}")
+    if 0x38 <= sub <= 0x3F and zz < 2:
+        width = 1 if zz == 0 else 2
+        if len(data) < mlen + 1 + width:
+            return None
+        imm = data[mlen + 1] if width == 1 else _u16(data, mlen + 1)
+        text = f"0x{imm:02X}" if width == 1 else f"0x{imm:04X}"
+        return done(_SRC_ALU[sub - 0x38] + suffix, f"{mem}, {text}", width)
+    if 0x40 <= sub <= 0x5F and zz < 2:
+        if zz == 0 and (r & 1) == 0:
+            return None          # byte RR: only the odd codes name WA/BC/DE/HL
+        dest = R16[r >> 1] if zz == 0 else R32[r]
+        return done(_SRC_MULDIV[(sub - 0x40) >> 3], f"{dest}, {mem}")
+    if 0x60 <= sub <= 0x6F and zz < 2:
+        n = (sub & 0x07) or 8
+        return done(("inc" if sub < 0x68 else "dec") + suffix, f"{n}, {mem}")
+    if 0x78 <= sub <= 0x7F and zz < 2:
+        return done(_SRC_SHIFT[sub - 0x78] + suffix, mem)
+    if sub >= 0x80:
+        op = _SRC_ALU[(sub - 0x80) >> 4]
+        if sub & 0x08:
+            return done(op, f"{mem}, {regs[r]}")
+        return done(op, f"{regs[r]}, {mem}")
+    return None
+
+
+def _source_memory_base_mnemonic(mnemonic: str | None) -> str | None:
+    if mnemonic is None:
+        return None
+    m = mnemonic.lower()
+    if m in _SRC_BASE_MNEMONICS:
+        return m
+    if m[-1:] in ("b", "w") and m[:-1] in _SRC_BASE_MNEMONICS:
+        return m[:-1]
+    return m
+
+
+def decode_instruction_at(bus: NgpcReadBus, pc: int) -> DecodeResult:
+    """Decode one instruction at an explicit address.
+
+    The source-memory group is checked against `_decode_source_memory_generic`:
+    a specialised decoder's answer is kept only when it has the same length and
+    the same operation; otherwise the generic decode wins.
+    """
+    legacy = _decode_instruction_at_legacy(bus, pc)
+    first, failure = _read_prefix(bus, pc, 1)
+    if failure is not None or not is_source_memory_prefix(first[0]):
+        return legacy
+    data, _ = _read_prefix(bus, pc, 8)
+    generic = _decode_source_memory_generic(data)
+    if generic is None:
+        return legacy
+    if (
+        legacy.status == "decoded"
+        and legacy.length == generic.length
+        and _source_memory_base_mnemonic(legacy.mnemonic)
+        == _source_memory_base_mnemonic(generic.mnemonic)
+    ):
+        return legacy
+    return _decoded_result(pc, generic, data[: generic.length])

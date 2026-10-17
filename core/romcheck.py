@@ -23,6 +23,7 @@ finding names the evidence it is based on.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -154,11 +155,80 @@ def _sym(symbols, pc: int) -> str:
             hit = symbols.lookup_address(pc)
         except Exception:
             hit = None
+        segments = _map_segments(symbols)
+        here = _segment_of(segments, pc)
+        if hit is not None and here is not None and _segment_of(segments, hit.address) != here:
+            # ⚠️ The nearest public symbol below is in ANOTHER module. A C file whose
+            # functions are all `static` exports nothing, so its code was being named
+            # after the previous module's last symbol -- KERO CROSS's game loop came
+            # out as `_SFXDriver_Z80+FE9`, a sound-driver DATA table in library.rel.
+            # The module and section are true; a borrowed name is not.
+            start, _end, section, module = here
+            return f"{module} {section}+{pc - start:X} ({pc:06X})"
         if hit is not None:
             delta = pc - hit.address
             name = hit.name if delta == 0 else f"{hit.name}+{delta:X}"
             return f"{name} ({pc:06X})"
     return f"PC {pc:06X}"
+
+
+_SEGMENT_RE = re.compile(
+    r"^\s+(?:rom|ram)\s+\S+\s+\S+\s+([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)\s+(\S+)\s+\((\S+?)\)")
+
+
+def _map_segments(symbols) -> list[tuple[int, int, str, str]]:
+    """(start, end exclusive, section, module) for every module block in the map.
+
+    The t900 map lists each module's contribution to each section, e.g.
+    `rom far_code CODE 200C20 D1B f_code (kero.rel)`. Parsed once, cached on the table.
+    """
+    cached = getattr(symbols, "_romcheck_segments", None)
+    if cached is not None:
+        return cached
+    segments: list[tuple[int, int, str, str]] = []
+    path = getattr(symbols, "source_path", "")
+    try:
+        for line in Path(path).read_text(encoding="latin-1").splitlines():
+            m = _SEGMENT_RE.match(line)
+            if m:
+                start, size = int(m.group(1), 16), int(m.group(2), 16)
+                segments.append((start, start + size, m.group(3), m.group(4)))
+    except (OSError, ValueError):
+        segments = []
+    try:
+        symbols._romcheck_segments = segments
+    except AttributeError:
+        pass
+    return segments
+
+
+def _segment_of(segments, address: int):
+    for seg in segments:
+        if seg[0] <= address < seg[1]:
+            return seg
+    return None
+
+
+def _ram_name(symbols, addr: int) -> str:
+    """'_paused (00403E)' when the map names that global, else the bare address.
+
+    The uninitialised-read finding is about VARIABLES; a list of addresses sends the
+    reader back to the map by hand for every line. (KERO CROSS, 2026-10-16: eight bare
+    addresses, one of which was the `paused` flag that froze the game on a console.)
+    A map entry only names the variable it starts; a hit inside an array or struct is
+    shown with its offset. Kept within 0x100 bytes so a gap in the map is not dressed
+    up as the previous variable.
+    """
+    if symbols is not None:
+        try:
+            hit = symbols.lookup_address(addr, max_span=0x100)
+        except Exception:
+            hit = None
+        if hit is not None and 0x4000 <= hit.address <= addr:
+            delta = addr - hit.address
+            name = hit.name if delta == 0 else f"{hit.name}+{delta:X}"
+            return f"{name} ({addr:06X})"
+    return f"{addr:06X}"
 
 
 def _hardware_safety(machine, report: "Report", symbols) -> None:
@@ -490,7 +560,7 @@ def analyse_dynamic(data: bytes, report: Report, bios: Path | None = None,
                 fw = first_write.get(addr)
                 when = (f"first written on frame {fw[0]} by {_sym(symbols, fw[1])}"
                         if fw else "never written during the run")
-                return (f"{addr:06X} read {n}x by "
+                return (f"{_ram_name(symbols, addr)} read {n}x by "
                         + ", ".join(_sym(symbols, p) for p in readers[:3])
                         + f" — {when}")
 

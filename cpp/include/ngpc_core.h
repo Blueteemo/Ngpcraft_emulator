@@ -38,7 +38,8 @@ extern "C" {
 /* 18: + ngpc_run_linked -- BOTH cabled consoles and the relay, inside the core;
  *     + ngpc_link_relay_count, so "how often was the cable relayed" stays
  *       measurable now that the relaying happens in here. */
-#define NGPC_ABI_VERSION 18
+/* 19: + ngpc_flash_peek -- the cartridge's CELLS, whatever mode the chip is in. */
+#define NGPC_ABI_VERSION 19
 
 /* ---------------------------------------------------------------- status --
  * Execution status of one instruction. The tri-state "requires-known-*"
@@ -319,6 +320,11 @@ NGPC_API int  ngpc_flash_dirty(ngpc_t*);
 NGPC_API void ngpc_flash_clear_dirty(ngpc_t*);
 NGPC_API int  ngpc_flash_restore(ngpc_t*, uint32_t address,
                                  const uint8_t* data, uint32_t len);
+/* What the cells HOLD, not what the chip ANSWERS. A chip that is busy, failed or in
+ * autoselect answers status / its ID to every read of its window, and `ngpc_read_mem`
+ * is a bus read. Persisting a save through it wrote that status over the whole .ngc.
+ * Same window check as `ngpc_flash_restore`; no side effect on the chip. ABI v19. */
+NGPC_API int  ngpc_flash_peek(ngpc_t*, uint32_t address, uint8_t* out, uint32_t len);
 
 /* --- silicon timing and machine geometry, for NATIVE front ends -------------
  *

@@ -160,6 +160,39 @@ def hw_report(machine: native.NativeMachine, limit: int = 8) -> dict:
     return out
 
 
+def hygiene_report(machine: native.NativeMachine, *, armed: bool, rom: Path | None = None,
+                   limit: int = 8) -> dict:
+    """User-RAM bytes (0x4000..0x6BFF) the ROM READ before ever writing them.
+
+    Each is a value that is 0 in this core and garbage on a console: the classic
+    "works in the emulator, frozen on hardware". Distinct addresses with the first
+    reader's PC; `core/romcheck.py` gives the full triage (who writes it, and when).
+    """
+    if not armed:
+        return {"armed": False, "note": "not armed when starting from a save state"}
+    samples = machine.uninit_read_samples()
+    first: dict[int, int] = {}
+    for s in samples:
+        first.setdefault(s.addr, s.pc)
+    out: dict = {"armed": True, "uninit_reads": machine.uninit_reads(),
+                 "uninit_addresses": len(first), "clean": not first}
+    if first:
+        # Named from the ROM's .map when one sits beside it -- same lookup as romcheck.
+        symbols = None
+        if rom is not None:
+            from core import romcheck
+            symbols = romcheck._load_symbols_for(rom)
+            name_ram, name_pc = romcheck._ram_name, romcheck._sym
+        out["first"] = [
+            {"addr": f"0x{a:06X}", "pc": f"0x{pc:06X}",
+             **({"variable": name_ram(symbols, a), "reader": name_pc(symbols, pc)}
+                if symbols is not None else {})}
+            for a, pc in list(first.items())[:limit]]
+        out["note"] = ("These read 0 here and noise on a console. Zero the statics at "
+                       "boot, or run core/romcheck.py for who writes them and when.")
+    return out
+
+
 def cmd_run(args: argparse.Namespace) -> dict:
     rom = Path(args.rom)
     bios = Path(args.bios).read_bytes() if args.bios else None
@@ -174,6 +207,16 @@ def cmd_run(args: argparse.Namespace) -> dict:
 
     if args.state:
         load_state(machine, Path(args.state))
+    else:
+        # READ BEFORE WRITE, armed from power-on. This core hands the cartridge a
+        # ZEROED work RAM; a console hands it whatever was there. A global the ROM
+        # never initialises therefore reads 0 here and noise there -- KERO CROSS
+        # (2026-10-16) ran perfectly in every run of this command and froze on
+        # hardware, because `paused` started non-zero. The counter existed (romcheck
+        # arms it) but no everyday run did. Armed AFTER the reset, as in romcheck:
+        # the reset writes RAM itself. Not armed from a save state, whose RAM is
+        # already the program's.
+        machine.set_hygiene(True)
 
     held = parse_buttons(args.hold)
     summary = None
@@ -208,6 +251,7 @@ def cmd_run(args: argparse.Namespace) -> dict:
         "timing": (native.active_timing_model() if args.timing == "silicon"
                    else args.timing),
         "hw_safety": hw_report(machine),
+        "hygiene": hygiene_report(machine, armed=not args.state, rom=rom),
     }
     if args.peek:
         addr, count = int(args.peek[0], 0), int(args.peek[1], 0)

@@ -26,6 +26,9 @@ from core.decode import (
     c7_current_bank_slice,
     d7_current_bank_slice,
     decode_instruction_at,
+    is_source_memory_prefix,
+    source_memory_mode,
+    source_memory_size_kind,
 )
 from core.fetch import NgpcFetchView, load_fetch_view
 from core.frame_timing import ESTIMATED_CYCLES_PER_INSTRUCTION
@@ -439,6 +442,17 @@ def _dispatch_execute_next(
     )
     if silicon_broken_result is not None:
         return silicon_broken_result
+
+    # Source-memory group (3 sizes x every mode): one executor, before the
+    # per-cell handlers -- see `_try_execute_source_memory`.
+    source_memory_result = _try_execute_source_memory(
+        view=view,
+        before_cpu=before_cpu,
+        before_memory=before_memory,
+        decoded=decoded,
+    )
+    if source_memory_result is not None:
+        return source_memory_result
 
     d8_copy_result = _try_execute_d8_df_register_copy(
         before_cpu=before_cpu,
@@ -19843,3 +19857,447 @@ def _evaluate_condition_code(cc_index: int, flags: StatusFlags) -> bool | None:
     if cc_index == 15:
         return None if cf is None else not cf
     raise ValueError(f"unsupported condition-code index: {cc_index}")
+
+
+# ---------------------------------------------------------------------------
+# SOURCE-MEMORY GROUP: one executor for every size and addressing mode.
+# ---------------------------------------------------------------------------
+# specs/TLCS900_MEMORY_FAMILY.md §2-§6, mirrored line for line from the native
+# core's `exec_source` (cpp/src/mem_family.cpp), which the differential gate
+# holds against this file. Before 2026-10-16 this group was covered cell by
+# cell; of 930 assembler-generated encodings, 305 stopped as unknown and others
+# executed the wrong operation (`mul WA,(#24)` as a store). Block transfers
+# (sub-ops 0x10..0x17) keep their dedicated handlers.
+
+_SRC_BASE_CYCLES_LOAD = {"byte": 4, "word": 4, "long": 6}
+_SRC_BASE_CYCLES_TO_MEM = {"byte": 6, "word": 6, "long": 10}
+_SRC_MULDIV_CYCLES = {
+    ("mul", "byte"): 13, ("mul", "word"): 16,
+    ("muls", "byte"): 11, ("muls", "word"): 14,
+    ("div", "byte"): 16, ("div", "word"): 24,
+    ("divs", "byte"): 19, ("divs", "word"): 27,
+}
+
+
+def _source_memory_effective_address(
+    before_cpu: NgpcCpuState, raw: bytes
+) -> tuple[int | None, dict[str, int] | None, str | None, str | None]:
+    """(EA, register write-back, refusal status, note) for a source-memory form.
+
+    EA is masked to the 24-bit bus. A refusal with status None means "not mine":
+    the caller returns None and lets a specialised handler try.
+    """
+    first = raw[0]
+    mm = ((first & 0x40) >> 2) | (first & 0x0F)
+
+    def reg32(index: int) -> int | None:
+        return getattr(before_cpu.regs, REG32_FIELDS[index])
+
+    if mm <= 15:
+        base = reg32(mm & 0x07)
+        if base is None:
+            return None, None, "requires-known-address-register", f"{R32[mm & 7]} must be known."
+        disp = _signed_u8(raw[1]) if mm >= 8 else 0
+        return _mask_address(base + disp), None, None, None
+    if mm == 16:
+        return raw[1], None, None, None
+    if mm == 17:
+        return int.from_bytes(raw[1:3], "little"), None, None, None
+    if mm == 18:
+        return int.from_bytes(raw[1:4], "little"), None, None, None
+    sec = raw[1]
+    if mm == 19:
+        if sec in (0x03, 0x07):
+            name, base, refusal = secondary_base_r32(before_cpu, raw[2])
+            if refusal is not None:
+                return None, None, "unimplemented", refusal
+            if sec == 0x03:
+                index_reg = _indexed_r8_index_from_code(raw[3])
+                kind = "byte"
+            else:
+                index_reg = _indexed_r16_index_from_code(raw[3])
+                kind = "word"
+            if index_reg is None:
+                return None, None, None, None
+            _, index_value = _extract_register_value(before_cpu, kind, index_reg)
+            if base is None or index_value is None:
+                return None, None, "requires-known-address-register", f"{name} and its index must be known."
+            index = (_indexed_signed_byte(index_value) if kind == "byte"
+                     else _indexed_signed_word(index_value))
+            return _mask_address(base + index), None, None, None
+        if (sec & 0x03) in (0x00, 0x01) and sec != 0x13:
+            name, base, refusal = secondary_base_r32(before_cpu, sec)
+            if refusal is not None:
+                return None, None, "unimplemented", refusal
+            if base is None:
+                return None, None, "requires-known-address-register", f"{name} must be known."
+            disp = 0
+            if sec & 0x01:
+                disp = int.from_bytes(raw[2:4], "little")
+                disp = disp - 0x10000 if disp >= 0x8000 else disp
+            return _mask_address(base + disp), None, None, None
+        return None, None, None, None
+    # (-r) / (r+): step from the operand byte (1/2/4), NOT from zz (spec §2).
+    step = {0: 1, 1: 2, 2: 4}.get(sec & 0x03)
+    if step is None or (sec & 0xFC) < 0xE0:
+        return None, None, None, None      # undefined step / banked register: not mine
+    index = (sec >> 2) & 0x07
+    base = reg32(index)
+    if base is None:
+        return None, None, "requires-known-address-register", f"{R32[index]} must be known."
+    if mm == 20:
+        new = (base - step) & 0xFFFFFFFF
+        return _mask_address(new), {REG32_FIELDS[index]: new}, None, None
+    new = (base + step) & 0xFFFFFFFF
+    return _mask_address(base), {REG32_FIELDS[index]: new}, None, None
+
+
+def _try_execute_source_memory(
+    view: NgpcFetchView,
+    before_cpu: NgpcCpuState,
+    before_memory: dict[int, int],
+    decoded: DecodeResult,
+) -> ExecutionResult | None:
+    raw = decoded.raw_bytes
+    if raw is None or not is_source_memory_prefix(raw[0]):
+        return None
+    mode = source_memory_mode(raw)
+    if mode is None or len(raw) <= mode[0]:
+        return None
+    mlen, mem_text = mode
+    sub = raw[mlen]
+    if 0x10 <= sub <= 0x17:
+        return None                        # block transfers: dedicated handlers
+    size_kind = source_memory_size_kind(raw[0])
+    width = {"byte": 1, "word": 2, "long": 4}[size_kind]
+    bits = width * 8
+    mask = (1 << bits) - 1
+    sign = 1 << (bits - 1)
+    r = sub & 0x07
+
+    ea, writeback, refusal, refusal_note = _source_memory_effective_address(before_cpu, raw)
+    if ea is None:
+        if refusal is None:
+            return None
+        return _blocked_result(before_cpu=before_cpu, decoded=decoded, status=refusal,
+                               note=f"Source-memory form {mem_text}: {refusal_note}")
+
+    # `ld XWA,(-XWA)`: the pointer is also the destination. Which write wins on
+    # silicon is not documented; the reference refuses rather than guess (the
+    # native core lets the destination win).
+    if writeback and (0x20 <= sub <= 0x27 or 0x30 <= sub <= 0x37 or (sub >= 0x80 and not sub & 0x08)
+                      or 0x40 <= sub <= 0x5F):
+        kind_bits = source_memory_size_kind(raw[0])
+        owner = (sub & 0x07) if kind_bits != "byte" else (sub & 0x07) // 2
+        if 0x40 <= sub <= 0x5F:
+            owner = (sub & 0x07) >> 1 if kind_bits == "byte" else sub & 0x07
+        if REG32_FIELDS[owner] in writeback:
+            return _blocked_result(
+                before_cpu=before_cpu, decoded=decoded,
+                status="unmodeled-register-alias-side-effects",
+                note=f"The destination aliases {R32[owner]}, the pointer this mode writes back.",
+            )
+
+    # The register file AFTER the addressing mode's write-back: a destination
+    # register is written on top of it, as on silicon (native `commit_wb` first).
+    cpu_wb = before_cpu
+    if writeback:
+        cpu_wb = replace(before_cpu, regs=replace(before_cpu.regs, **writeback))
+
+    # Refusal name for an unknown REGISTER OPERAND, kept as the per-family
+    # handlers named it: "source" for the (R)/(R+d8) forms, "full" elsewhere.
+    operand_status = ("requires-known-source-register"
+                      if (((raw[0] & 0x40) >> 2) | (raw[0] & 0x0F)) <= 15
+                      else "requires-known-full-register")
+
+    def blocked(status: str, note: str) -> ExecutionResult:
+        return _blocked_result(before_cpu=before_cpu, decoded=decoded, status=status, note=note)
+
+    def read(address: int, count: int) -> int | None:
+        data = _read_runtime_bytes(view, before_memory, address, count)
+        return None if data is None else int.from_bytes(data, "little")
+
+    def finish(*, reg_updates=None, written=(), writes=(), flags=None, cycles, note,
+               memory=None) -> ExecutionResult:
+        updates = dict(writeback or {})
+        if reg_updates:
+            updates.update(reg_updates)
+        return _executed_result(
+            before_cpu=before_cpu,
+            decoded=decoded,
+            written_registers=(*written, *((R32[i] for i in range(8)
+                                           if writeback and REG32_FIELDS[i] in writeback)), "PC"),
+            memory_writes=writes,
+            after_memory=before_memory if memory is None else memory,
+            new_pc=decoded.next_sequential_pc,
+            reg_updates=updates or None,
+            flags_updates=flags,
+            note=f"Executed {decoded.assembly} (source-memory group). {note}",
+            cycles_consumed=cycles,
+        )
+
+    def store(address: int, value: int, count: int):
+        """(memory_writes, after_memory) or a blocked result."""
+        data = (value & ((1 << (8 * count)) - 1)).to_bytes(count, "little")
+        status, wnote = _check_writable_range(view, address, count)
+        if status == "write-discarded":
+            return (MemoryWrite(address=address, data=data, note=f"[DISCARDED] {wnote}"),), before_memory
+        if status is not None:
+            return blocked(status, wnote)
+        after = dict(before_memory)
+        for i, b in enumerate(data):
+            after[_mask_address(address + i)] = b
+        return (MemoryWrite(address=address, data=data, note=f"Wrote {mem_text}."),), after
+
+    def set_reg(kind: str, index: int, value: int):
+        name, updates = _build_register_update(cpu_wb, kind, index, value)
+        if updates is None:
+            return name, None
+        return name, updates
+
+    def flag_known(name: str) -> bool | None:
+        return getattr(before_cpu.flags, name)
+
+    mv = read(ea, width)
+    if mv is None:
+        return blocked("runtime-memory-unavailable",
+                       f"{mem_text} = 0x{ea:06X} needs {width} readable byte(s).")
+
+    # PUSH (mem) -- byte/word, 6 states.
+    if sub == 0x04:
+        if size_kind == "long":
+            return None
+        sp = getattr(cpu_wb.regs, REG32_FIELDS[7])
+        if sp is None:
+            return blocked("requires-known-stack-pointer", "XSP must be known for PUSH.")
+        new_sp = (sp - width) & 0xFFFFFFFF
+        result = store(_mask_address(new_sp), mv, width)
+        if isinstance(result, ExecutionResult):
+            return result
+        writes, after = result
+        return finish(reg_updates={REG32_FIELDS[7]: new_sp}, written=("XSP",), writes=writes, memory=after,
+                      cycles=6, note=f"Pushed 0x{mv:0{width * 2}X}.")
+
+    # RLD / RRD A,(mem) -- byte only; datasheet: S Z from A, H=0, V parity, N=0, C kept.
+    if sub in (0x06, 0x07) and size_kind == "byte":
+        _, a = _extract_register_value(cpu_wb, "byte", 1)
+        if a is None:
+            return blocked(operand_status, "A must be known.")
+        if sub == 0x06:
+            new_mem = ((mv << 4) | (a & 0x0F)) & 0xFF
+            new_a = (a & 0xF0) | (mv >> 4)
+        else:
+            new_mem = ((a & 0x0F) << 4) | (mv >> 4)
+            new_a = (a & 0xF0) | (mv & 0x0F)
+        result = store(ea, new_mem, 1)
+        if isinstance(result, ExecutionResult):
+            return result
+        writes, after = result
+        name, updates = set_reg("byte", 1, new_a)
+        if updates is None:
+            return blocked("requires-known-full-register", "XWA must be known to write A.")
+        return finish(reg_updates=updates, written=(name,), writes=writes, memory=after,
+                      flags={"sf": bool(new_a & 0x80), "zf": new_a == 0, "hf": False,
+                             "vf": _has_even_parity(new_a), "nf": False},
+                      cycles=12, note="Nibble rotate between A and memory.")
+
+    # LD (#16),(mem) -- memory to memory, byte/word, 8 states.
+    if sub == 0x19:
+        if size_kind == "long":
+            return None
+        dest = int.from_bytes(raw[mlen + 1:mlen + 3], "little")
+        result = store(dest, mv, width)
+        if isinstance(result, ExecutionResult):
+            return result
+        writes, after = result
+        return finish(writes=writes, memory=after, cycles=8, note=f"Copied to 0x{dest:04X}.")
+
+    # LD R,(mem) -- 4 / 4 / 6.
+    if 0x20 <= sub <= 0x27:
+        name, updates = set_reg(size_kind, r, mv)
+        if updates is None:
+            return blocked("requires-known-full-register", f"The owner of {name} must be known.")
+        return finish(reg_updates=updates, written=(name,),
+                      cycles=_SRC_BASE_CYCLES_LOAD[size_kind], note=f"Loaded 0x{mv:X}.")
+
+    # EX (mem),R -- byte/word, 6 states.
+    if 0x30 <= sub <= 0x37:
+        if size_kind == "long":
+            return None
+        rname, rv = _extract_register_value(cpu_wb, size_kind, r)
+        if rv is None:
+            return blocked(operand_status, f"{rname} must be known.")
+        result = store(ea, rv, width)
+        if isinstance(result, ExecutionResult):
+            return result
+        writes, after = result
+        name, updates = set_reg(size_kind, r, mv)
+        if updates is None:
+            return blocked("requires-known-full-register", f"The owner of {name} must be known.")
+        return finish(reg_updates=updates, written=(name,), writes=writes, memory=after,
+                      cycles=6, note="Exchanged memory and register.")
+
+    def alu(op: str, left: int, right: int) -> tuple[int, dict | None] | ExecutionResult:
+        carry = 0
+        if op in ("adc", "sbc"):
+            cf = flag_known("cf")
+            if cf is None:
+                return blocked("runtime-state-required", f"{op.upper()} needs a known carry flag.")
+            carry = int(cf)
+        if op in ("add", "adc"):
+            res = (left + right + carry) & mask
+            flags = dict(_compute_add_flags(size_kind, left, right + carry))
+        elif op in ("sub", "sbc", "cp"):
+            res = (left - right - carry) & mask
+            flags = dict(_compute_subtract_flags(size_kind, left, right + carry))
+        else:
+            res = {"and": left & right, "xor": left ^ right, "or": left | right}[op] & mask
+            flags = dict(_compute_logical_flags(size_kind, res, half_carry=(op == "and")))
+        # H and V are written at EVERY size, LONG included: Toshiba's symbol rows
+        # are size-independent and both cores already do so in every other
+        # handler. (Spec §5's "untouched in long" rows disagree with both; the
+        # differential gate settled it on 2026-10-16.)
+        return res, flags
+
+    # ALU (mem),#imm -- byte/word; 7 / 8, CP 5 / 6.
+    if 0x38 <= sub <= 0x3F:
+        if size_kind == "long":
+            return None
+        op = ("add", "adc", "sub", "sbc", "and", "xor", "or", "cp")[sub - 0x38]
+        imm = int.from_bytes(raw[mlen + 1:mlen + 1 + width], "little")
+        out = alu(op, mv, imm)
+        if isinstance(out, ExecutionResult):
+            return out
+        res, flags = out
+        if op == "cp":
+            return finish(flags=flags, cycles=5 if size_kind == "byte" else 6,
+                          note=f"Compared with 0x{imm:X}.")
+        result = store(ea, res, width)
+        if isinstance(result, ExecutionResult):
+            return result
+        writes, after = result
+        return finish(writes=writes, memory=after, flags=flags,
+                      cycles=7 if size_kind == "byte" else 8, note=f"{op.upper()} 0x{imm:X}.")
+
+    # MUL / MULS / DIV / DIVS RR,(mem) -- byte/word. MUL writes no flag; DIV writes V.
+    if 0x40 <= sub <= 0x5F:
+        if size_kind == "long":
+            return None
+        kind = ("mul", "muls", "div", "divs")[(sub - 0x40) >> 3]
+        if size_kind == "byte" and (r & 1) == 0:
+            return None
+        rr = r >> 1 if size_kind == "byte" else r
+        dest_kind = "word" if size_kind == "byte" else "long"
+        dname, dv = _extract_register_value(cpu_wb, dest_kind, rr)
+        if dv is None:
+            return blocked("requires-known-full-register", f"{dname} must be known.")
+        half_mask = mask
+        wide_mask = (1 << (2 * bits)) - 1
+
+        def signed(value: int, nbits: int) -> int:
+            value &= (1 << nbits) - 1
+            return value - (1 << nbits) if value & (1 << (nbits - 1)) else value
+
+        flags = None
+        if kind == "mul":
+            res = ((dv & half_mask) * mv) & wide_mask
+        elif kind == "muls":
+            res = (signed(dv, bits) * signed(mv, bits)) & wide_mask
+        else:
+            if mv == 0:
+                return blocked("division-by-zero",
+                               f"{kind.upper()} by zero: Toshiba defines V, not the destination.")
+            if kind == "div":
+                q, rem = (dv & wide_mask) // mv, (dv & wide_mask) % mv
+                overflow = q > half_mask
+            else:
+                n, d = signed(dv, 2 * bits), signed(mv, bits)
+                q = int(n / d)
+                rem = n - q * d
+                overflow = q < -(1 << (bits - 1)) or q > (1 << (bits - 1)) - 1
+            res = ((rem & half_mask) << bits) | (q & half_mask)
+            flags = {"vf": overflow}
+        name, updates = set_reg(dest_kind, rr, res)
+        if updates is None:
+            return blocked("requires-known-full-register", f"The owner of {name} must be known.")
+        return finish(reg_updates=updates, written=(name,), flags=flags,
+                      cycles=_SRC_MULDIV_CYCLES[(kind, size_kind)], note=f"{kind.upper()} -> 0x{res:X}.")
+
+    # INC / DEC #n,(mem) -- byte/word, n = 0 means 8; C untouched; 6 states.
+    if 0x60 <= sub <= 0x6F:
+        if size_kind == "long":
+            return None
+        n = (sub & 0x07) or 8
+        if sub >= 0x68:
+            res = (mv - n) & mask
+            flags = dict(_compute_subtract_flags(size_kind, mv, n))
+        else:
+            res = (mv + n) & mask
+            flags = dict(_compute_add_flags(size_kind, mv, n))
+        flags.pop("cf")
+        result = store(ea, res, width)
+        if isinstance(result, ExecutionResult):
+            return result
+        writes, after = result
+        return finish(writes=writes, memory=after, flags=flags, cycles=6,
+                      note=f"{'DEC' if sub >= 0x68 else 'INC'} {n}.")
+
+    # RLC RRC RL RR SLA SRA SLL SRL (mem) -- byte/word, one bit, 6 states.
+    if 0x78 <= sub <= 0x7F:
+        if size_kind == "long":
+            return None
+        cf = flag_known("cf")
+        kind = sub & 0x07
+        if kind in (2, 3) and cf is None:
+            return blocked("runtime-state-required", "RL/RR need a known carry flag.")
+        v = mv
+        if kind == 0:
+            out = bool(v & sign); v = ((v << 1) | int(out)) & mask
+        elif kind == 1:
+            out = bool(v & 1); v = (v >> 1) | (sign if out else 0)
+        elif kind == 2:
+            out = bool(v & sign); v = ((v << 1) | int(cf)) & mask
+        elif kind == 3:
+            out = bool(v & 1); v = (v >> 1) | (sign if cf else 0)
+        elif kind in (4, 6):
+            out = bool(v & sign); v = (v << 1) & mask
+        elif kind == 5:
+            out = bool(v & 1); v = (v >> 1) | (v & sign)
+        else:
+            out = bool(v & 1); v = v >> 1
+        flags = {"sf": bool(v & sign), "zf": v == 0, "hf": False,
+                 "vf": _has_even_parity(v), "nf": False, "cf": out}
+        result = store(ea, v, width)
+        if isinstance(result, ExecutionResult):
+            return result
+        writes, after = result
+        return finish(writes=writes, memory=after, flags=flags, cycles=6, note="Shifted by one.")
+
+    # ALU R,(mem) / ALU (mem),R -- 4/4/6 and 6/6/10; CP 4/4/6 both ways.
+    if sub >= 0x80:
+        op = ("add", "adc", "sub", "sbc", "and", "xor", "or", "cp")[(sub - 0x80) >> 4]
+        to_memory = bool(sub & 0x08)
+        rname, rv = _extract_register_value(cpu_wb, size_kind, r)
+        if rv is None:
+            return blocked(operand_status, f"{rname} must be known.")
+        left, right = (mv, rv) if to_memory else (rv, mv)
+        out = alu(op, left, right)
+        if isinstance(out, ExecutionResult):
+            return out
+        res, flags = out
+        if op == "cp":
+            return finish(flags=flags, cycles=_SRC_BASE_CYCLES_LOAD[size_kind], note="Compared.")
+        if to_memory:
+            result = store(ea, res, width)
+            if isinstance(result, ExecutionResult):
+                return result
+            writes, after = result
+            return finish(writes=writes, memory=after, flags=flags,
+                          cycles=_SRC_BASE_CYCLES_TO_MEM[size_kind], note=f"{op.upper()} into memory.")
+        name, updates = set_reg(size_kind, r, res)
+        if updates is None:
+            return blocked("requires-known-full-register", f"The owner of {name} must be known.")
+        return finish(reg_updates=updates, written=(name,), flags=flags,
+                      cycles=_SRC_BASE_CYCLES_LOAD[size_kind], note=f"{op.upper()} into {name}.")
+
+    return None

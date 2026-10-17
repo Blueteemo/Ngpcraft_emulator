@@ -2430,7 +2430,7 @@ class ExecuteNextTests(unittest.TestCase):
     def test_execute_post_increment_long_load_updates_register_and_pointer(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             rom_path = Path(tmpdir) / "demo.ngc"
-            self._write_demo_rom(rom_path, 0x00201530, b"\xE5\xF1\x23")
+            self._write_demo_rom(rom_path, 0x00201530, b"\xE5\xF2\x23")  # ld XHL,(XIX+) as asm900 encodes it (step 4)
             base_view = load_fetch_view(rom_path)
             seeded_cpu = replace(
                 base_view.machine.cpu,
@@ -3647,7 +3647,7 @@ class ExecuteNextTests(unittest.TestCase):
     def test_execute_pre_decrement_word_load_updates_register_and_address(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             rom_path = Path(tmpdir) / "demo.ngc"
-            self._write_demo_rom(rom_path, 0x00200040, b"\xD4\xE8\x23")  # ld HL, (-XDE)
+            self._write_demo_rom(rom_path, 0x00200040, b"\xD4\xE9\x23")  # ld HL, (-XDE) -- asm900: step 2
             base_view = load_fetch_view(rom_path)
             seeded_cpu = seed_cpu_state_for_execution(
                 base_view.machine.cpu,
@@ -3670,7 +3670,7 @@ class ExecuteNextTests(unittest.TestCase):
     def test_execute_pre_decrement_long_load_updates_register_and_address(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             rom_path = Path(tmpdir) / "demo.ngc"
-            self._write_demo_rom(rom_path, 0x00200040, b"\xE4\xE0\x21")  # ld XBC, (-XWA)
+            self._write_demo_rom(rom_path, 0x00200040, b"\xE4\xE2\x21")  # ld XBC, (-XWA) -- asm900: step 4
             base_view = load_fetch_view(rom_path)
             seeded_cpu = seed_cpu_state_for_execution(
                 base_view.machine.cpu,
@@ -3693,7 +3693,7 @@ class ExecuteNextTests(unittest.TestCase):
     def test_execute_pre_decrement_load_blocks_on_aliasing_destination(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             rom_path = Path(tmpdir) / "demo.ngc"
-            self._write_demo_rom(rom_path, 0x00200040, b"\xE4\xE0\x20")  # ld XWA, (-XWA)
+            self._write_demo_rom(rom_path, 0x00200040, b"\xE4\xE2\x20")  # ld XWA, (-XWA) -- asm900: step 4
             base_view = load_fetch_view(rom_path)
             seeded_cpu = seed_cpu_state_for_execution(
                 base_view.machine.cpu,

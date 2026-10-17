@@ -1559,15 +1559,17 @@ class DecodeTests(unittest.TestCase):
             self.assertEqual(result.length, 2)
             self.assertEqual(result.assembly, "inc 1, XIY")
 
-    def test_decode_broken_d0_prefix_with_warning(self) -> None:
-        # Migrated 2026-07-08: the old `D0 61` fixture asserted the retired
-        # "D0 reg-direct is silicon-broken" semantic. D0..D7 is now the WORD
-        # MEMORY-addressing family (HW-confirmed), so `D0 61` decodes cleanly as
-        # a memory op (`cpw (0x61), SP`) and is no longer flagged. The genuinely
-        # still-broken D0 form is the ALU-IMMEDIATE encoding `D0 C8 01 00` =
-        # `add WA, 0x0001` (real-NGPC crash 2026-05-20). Re-point to it so this
-        # test keeps exercising the same "!BROKEN D0..D7 decoded-with-warning"
-        # mechanism.
+    def test_decode_d0_c8_is_memory_form_with_undefined_subop(self) -> None:
+        # Migrated 2026-10-16. This test used to assert `D0 C8 01 00` = `add WA,
+        # 0x0001` with a "!BROKEN D0..D7" warning: the register-prefix reading of
+        # 0xD0 that the console refuted on 2026-07-03 (hw_test_d0). The executor
+        # dropped that row on 2026-07-12; the decoder kept it until 2026-10-16.
+        # The 2026-05-20 crash behind the warning was OUR compiler emitting D0
+        # for a word-register immediate (quirks_db v13 retired the quirk).
+        # Read as what it is -- word memory (0xC8), then sub-op 0x01 -- the
+        # instruction has no defined operation (spec TLCS900_MEMORY_FAMILY §3),
+        # so the honest answer is "unknown", never a register op of a guessed
+        # length.
         with tempfile.TemporaryDirectory() as tmpdir:
             rom_path = Path(tmpdir) / "demo.ngc"
             self._write_demo_rom(rom_path, 0x00200040, b"\xD0\xC8\x01\x00")
@@ -1575,11 +1577,8 @@ class DecodeTests(unittest.TestCase):
 
             result = decode_instruction_at(bus, 0x00200040)
 
-            self.assertEqual(result.status, "decoded")
-            self.assertEqual(result.assembly, "add WA, 0x0001")
-            self.assertIsNotNone(result.warning)
-            assert result.warning is not None
-            self.assertIn("!BROKEN D0..D7", result.warning)
+            self.assertEqual(result.status, "unknown-opcode")
+            self.assertIsNone(result.length)
 
     def test_decode_prefixed_byte_ext_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

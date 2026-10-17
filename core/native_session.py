@@ -492,7 +492,7 @@ class NativeSession:
             # map disagree about which card this is.
             self.machine.write(BIOS_FLASH_CARD_TYPE, bytes([flash_size_code(die)]))
         if die and die > len(self._rom):
-            self._rom = self._orig_rom = bytes(self.machine.read(flash_file.CART_BASE, die))
+            self._rom = self._orig_rom = bytes(self.machine.flash_peek(flash_file.CART_BASE, die))
 
         # THE SAVE. The cartridge is the save -- a game erases a block of its own ROM
         # and programs its slot back in -- so restoring one means putting those bytes
@@ -667,7 +667,11 @@ class NativeSession:
         CARTRIDGE BACK AS ZEROS. Any 4 MiB game that saves would have destroyed its own
         ROM file the first time it did (measured: bytes 2 MiB..4 MiB all zero).
         """
-        return b"".join(self.machine.read(base, size) for base, size in self._cart_windows())
+        # ⛔ AND IT IS THE CELLS, NOT THE BUS (`flash_peek`, not `read`). A chip caught
+        # mid-operation answers status to every address: quitting while a game sat in
+        # its flash poll wrote `00 40 00 40 ...` over the whole .ngc (user report
+        # 2026-10-17) -- header gone, the file then stops at the BIOS everywhere.
+        return b"".join(self.machine.flash_peek(base, size) for base, size in self._cart_windows())
 
     def reboot(self) -> None:
         """POWER OFF, POWER ON. The cartridge never left the slot.
@@ -690,7 +694,9 @@ class NativeSession:
         # is not a cartridge at all -- and `flash_restore` rightly refused it, so
         # rebooting Metal Slug 2nd Mission, SvC MotM or Densha de Go! 2 raised instead
         # of rebooting. Snapshot each die from where its pins actually are.
-        cartridge = [(base, self.machine.read(base, size))
+        # The CELLS, not the bus: a reboot mid-save (F5, attaching player 2) snapshotted
+        # the chip's status bytes and put THEM back as the cartridge. See _read_cart_image.
+        cartridge = [(base, self.machine.flash_peek(base, size))
                      for base, size in self._cart_windows()]
         coin_cell = self.machine.battery_ram() if self.real_bios else None
         # The clock is coin-cell state too, and rebooting the console does not reset the

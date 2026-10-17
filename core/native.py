@@ -43,7 +43,7 @@ from core import bios_fingerprint
 # 18: + ngpc_run_linked -- both cabled consoles and the relay, inside the core.
 # Must track NGPC_ABI_VERSION in cpp/include/ngpc_core.h -- the loader compares
 # them and asks for a rebuild.
-ABI_VERSION = 18
+ABI_VERSION = 19
 
 # How the machine comes up (NGPC_RESET_* in ngpc_core.h). This was a bool, and a third
 # case was hiding inside it: "no hand-off" ALSO started at the cart's entry point, so
@@ -713,6 +713,8 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_flash_clear_dirty.restype = None
     lib.ngpc_flash_restore.argtypes = [c_void_p, c_uint32, POINTER(c_uint8), c_uint32]
     lib.ngpc_flash_restore.restype = c_int
+    lib.ngpc_flash_peek.argtypes = [c_void_p, c_uint32, POINTER(c_uint8), c_uint32]
+    lib.ngpc_flash_peek.restype = c_int
     lib.ngpc_get_write_log.argtypes = [c_void_p, POINTER(WriteRec), c_uint32]
     lib.ngpc_get_write_log.restype = c_uint32
     lib.ngpc_get_read_log.argtypes = [c_void_p, POINTER(ReadRec), c_uint32]
@@ -1603,6 +1605,17 @@ class NativeMachine:
         buf = _buf(data)
         if self._lib.ngpc_flash_restore(self._h, address, buf, len(data)) != 0:
             raise ValueError(f"flash_restore: {address:#08x}+{len(data)} is not in the cart window")
+
+    def flash_peek(self, address: int, count: int) -> bytes:
+        """What the cartridge's cells HOLD, whatever mode the chip is in.
+
+        `read` is a BUS read: a busy / failed / autoselect chip answers status or its ID
+        there. Anything that persists or snapshots the cartridge must use this instead,
+        or it saves the chip's status as the game (it did: the whole .ngc)."""
+        out = (c_uint8 * count)()
+        if self._lib.ngpc_flash_peek(self._h, address, out, count) != 0:
+            raise ValueError(f"flash_peek: {address:#08x}+{count} is not in the cart window")
+        return bytes(out)
 
     def close(self) -> None:
         if getattr(self, "_h", None):

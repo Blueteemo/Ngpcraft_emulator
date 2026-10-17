@@ -443,7 +443,7 @@ void initialize_save_ram() {
         const uint32_t capacity = ngpc_flash_capacity(machine, chip);
         save_ram.capacity[chip] = capacity;
         if (capacity >= kFlashTailSize)
-            ngpc_read_mem(machine, tail_address(chip, capacity),
+            ngpc_flash_peek(machine, tail_address(chip, capacity),
                           save_ram.flash_tail[chip], kFlashTailSize);
     }
     if (using_external_bios_boot())
@@ -488,7 +488,7 @@ void sync_save_ram() {
         const uint32_t capacity = ngpc_flash_capacity(machine, chip);
         save_ram.capacity[chip] = capacity;
         if (capacity >= kFlashTailSize)
-            ngpc_read_mem(machine, tail_address(chip, capacity),
+            ngpc_flash_peek(machine, tail_address(chip, capacity),
                           save_ram.flash_tail[chip], kFlashTailSize);
     }
     if (using_external_bios_boot())

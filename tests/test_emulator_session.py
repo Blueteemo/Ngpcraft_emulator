@@ -986,8 +986,10 @@ class OpcodeCoverageCliTests(unittest.TestCase):
         # Body with a known-good NOP and a known-unknown 0xE3.
         with tempfile.TemporaryDirectory() as tmpdir:
             rom = Path(tmpdir) / "demo.ngc"
-            # 0x00 NOP, 0xE3 (unknown), 0x00 NOP, 0xE3 unknown.
-            _write_demo_rom(rom, b"\x00\xE3\x00\xE3")
+            # 0x00 NOP, 0xD6 (invalid prefix, spec section 1), 0x00 NOP, 0xD6.
+            # (0xE3 used to stand in for "unknown", but `E3 00 E3` is a valid
+            # `or XHL,(XWA0)` -- the source-memory decoder now reads it.)
+            _write_demo_rom(rom, b"\x00\xD6\x00\xD6")
             from ngpc_emu import main
             stdout = io.StringIO()
             import contextlib
@@ -1000,7 +1002,7 @@ class OpcodeCoverageCliTests(unittest.TestCase):
             payload = _json.loads(stdout.getvalue())
             tops = payload["top_unknown_opcodes"]
             self.assertGreater(len(tops), 0)
-            self.assertEqual(tops[0]["byte_hex"], "0xE3")
+            self.assertEqual(tops[0]["byte_hex"], "0xD6")
             self.assertGreaterEqual(tops[0]["count"], 2)
 
     def test_coverage_can_stop_on_known_silicon_broken_opcode(self) -> None:

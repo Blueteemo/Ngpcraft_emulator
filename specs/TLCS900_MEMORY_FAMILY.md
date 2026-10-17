@@ -171,15 +171,15 @@ Bit layout of `F`: `S=0x80  Z=0x40  H=0x10  V=0x04  N=0x02  C=0x01`.
 | Op | S | Z | H | V | N | C |
 |---|---|---|---|---|---|---|
 | `ADD`/`ADC` byte, word | msb | `==0` | half-carry | signed overflow | 0 | carry |
-| `ADD`/`ADC` **long** | msb | `==0` | **untouched** | signed overflow | 0 | carry |
+| `ADD`/`ADC` **long** | msb | `==0` | **written** ⚠️ | signed overflow | 0 | carry |
 | `SUB`/`SBC`/`CP` byte, word | msb | `==0` | half-borrow | signed overflow | 1 | borrow |
-| `SUB`/`SBC`/`CP` **long** | msb | `==0` | **untouched** | signed overflow | 1 | borrow |
-| **`AND`** | msb | `==0` | **1** | **PARITY** (byte/word); **untouched for LONG** | 0 | 0 |
-| **`OR`** / **`XOR`** | msb | `==0` | **0** | **PARITY** (byte/word); **untouched for LONG** | 0 | 0 |
+| `SUB`/`SBC`/`CP` **long** | msb | `==0` | **written** ⚠️ | signed overflow | 1 | borrow |
+| **`AND`** | msb | `==0` | **1** | **PARITY**, every size ⚠️ | 0 | 0 |
+| **`OR`** / **`XOR`** | msb | `==0` | **0** | **PARITY**, every size ⚠️ | 0 | 0 |
 | `INC #n,(mem)` | msb | `==0` | half | overflow | 0 | **untouched** |
 | `DEC #n,(mem)` | msb | `==0` | half | overflow | 1 | **untouched** |
 | `RLC/RRC/SLA/SRA/SLL/SRL` | msb | `==0` | 0 | parity | 0 | shifted-out bit |
-| `RL` / `RR` | msb | `==0` | **untouched** | parity | **untouched** | shifted-out bit |
+| `RL` / `RR` (mem) | msb | `==0` | **0** ⚠️ | parity | **0** ⚠️ | shifted-out bit |
 | `LDI/LDIR/LDD/LDDR` | — | — | 0 | **`BC != 0`** after `--BC` | 0 | — |
 | `CPI/CPD/CPIR/CPDR` | from SUB | from SUB | from SUB | **`BC != 0`** (overrides) | 1 | from SUB |
 | `MUL`/`MULS` | — | — | — | — | — | — (no flags) |
@@ -190,8 +190,16 @@ Bit layout of `F`: `S=0x80  Z=0x40  H=0x10  V=0x04  N=0x02  C=0x01`.
 
 **V is the PARITY flag for the logical ops** (even population count → V=1) — and
 **`AND` SETS H**. Both were corrected in our Python core on 2026-07-09 by triage
-against a reference trace, and both are confirmed here. **In LONG size, the logical ops leave
-V untouched** (there is no 32-bit parity).
+against a reference trace, and both are confirmed here. 
+
+> ⚠️ **Corrected 2026-10-16.** This table used to say that LONG `ADD/SUB` leave H
+> untouched, that LONG `AND/OR/XOR` leave V untouched, and that `RL/RR (mem)` leave
+> H and N untouched. **Neither core does that**: the native `alu_*_flags` and
+> `exec_source` write H and the parity at every size and clear H/N on every memory
+> shift, and the Python reference does the same in every handler (Toshiba's symbol
+> rows are size-independent). The new Python source-memory executor was first written
+> from this table and the differential gate flagged 148 encodings until it matched the
+> cores. **No console test settles the LONG H/V or the RL/RR H/N case yet.**
 
 ---
 

@@ -101,6 +101,24 @@ NGPC_API int ngpc_flash_restore(ngpc_t* h, uint32_t address,
     return 0;
 }
 
+/* ⛔ THE SAVE IS THE CELLS, NOT THE BUS. `read8` asks the flash state machine first:
+ * a chip that is busy (an erase or a program in progress, or the endless window of a
+ * 1 asked over a 0), failed, or in autoselect answers STATUS or its ID to every
+ * address of its window -- and the FlashAck read even consumes the "done". Saving
+ * through it while a game sat in its poll loop wrote `00 40 00 40 ...` over all
+ * 2 MiB of the .ngc: header gone, every emulator and the flashcart then stop at the
+ * BIOS. User report 2026-10-17, reproduced. `mem` holds what the cells hold (a program
+ * or an erase commits its bytes before arming the busy window). */
+NGPC_API int ngpc_flash_peek(ngpc_t* h, uint32_t address, uint8_t* out, uint32_t len) {
+    if (!h || !out) return -1;
+    const Machine* m = reinterpret_cast<const Machine*>(h);
+    const bool in_chip0 = address >= 0x200000 && uint64_t(address) + len <= 0x400000;
+    const bool in_chip1 = address >= 0x800000 && uint64_t(address) + len <= 0xA00000;
+    if (!in_chip0 && !in_chip1) return -1;
+    for (uint32_t i = 0; i < len; ++i) out[i] = m->mem[address + i];
+    return 0;
+}
+
 /* ⚡ THE COIN CELL. Hand the console the RAM it had when it was last switched off --
  * and hand it over BEFORE resetting, because `ngpc_reset` consults the marker INSIDE
  * that RAM to decide whether this is a first-ever boot or a resume. Restoring it after
