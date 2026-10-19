@@ -117,6 +117,13 @@ def _bring_up(sh, far_sock, far_image: bytes, cap: int = 4000, announce=None,
 
 
 
+def _far_says_hello(far) -> None:
+    """Make the far end of `_bring_up` open its session -- which is to say, send its
+    session hello -- without simulating anything. A test that feeds the shell the
+    peer's inputs by hand still needs that hello: no frame is played before it."""
+    MirrorSession(FakeMachine(), FakeMachine(), FakeLink(), far.pipe, far.hs)
+
+
 class _Trickle:
     """A socket that only ever accepts `cap` bytes per send.
 
@@ -372,6 +379,13 @@ class FakeLink:
         self.pumps += 1
 
 
+def _say_hello(far_pipe, delay: int) -> None:
+    """The other PC's session hello, and nothing else: enough for a lone session to
+    start playing its pre-filled frames."""
+    MirrorSession(FakeMachine(), FakeMachine(), FakeLink(), far_pipe,
+                  Handshake(rom_hash="r", bios_hash="b", core_version="c", delay=delay))
+
+
 def _pair(delay: int = 3, delay_pumps: int = 0, *, tags=(1, 1), hs_kw=None):
     pa, pb = ListPipe.pair(delay_pumps)
     kw = dict(rom_hash="R", bios_hash="B", core_version="C", delay=delay)
@@ -414,6 +428,30 @@ def test_a_frame_whose_input_has_not_arrived_stalls_instead_of_guessing():
     assert outcomes == {"waiting"}, "it made a button up rather than wait"
     assert a.local.frames == frames, "it ran a frame on an input it did not have"
     assert a.stalls >= 5                     # the ping, visible as a number
+
+
+def test_no_frame_is_played_before_the_peer_session_says_hello():
+    """⚡ THE SIDE THAT FINISHES THE TRADE FIRST MUST NOT START ALONE.
+
+    It used to play its pre-filled frames at once, then freeze until the other PC's
+    session existed. MEASURED with two headless bots on an 80 ms line: the early side
+    froze ~0.4 s, that freeze landed in its first round trip (425-535 ms), its delay
+    jumped to 14-18 frames, and it then ran AHEAD of the peer for the whole match with
+    no slack left -- every hiccup of the line a freeze on its screen, none on the other.
+    """
+    pa, pb = ListPipe.pair()
+    kw = dict(rom_hash="R", bios_hash="B", core_version="C", delay=3)
+    early = MirrorSession(FakeMachine(), FakeMachine(), FakeLink(), pa,
+                          Handshake(host=True, **kw))
+    for _ in range(10):                     # the peer's session does not exist yet
+        assert early.step(0x10) == "waiting"
+    assert early.local.frames == 0, "it ran frames before the peer was there"
+    assert early.frames_run == 0
+    late = MirrorSession(FakeMachine(), FakeMachine(), FakeLink(), pb,
+                         Handshake(host=False, **kw))
+    assert early.step(0x10) == "ran"        # the hello is here: play
+    assert late.step(0x20) == "ran"
+    assert _same_streams(early, late)
 
 
 def test_a_waiting_session_keeps_pushing_the_wire():
@@ -686,13 +724,15 @@ def test_the_mirrors_own_cable_is_stepped_like_a_cable():
         local.reset(bios_handoff=True)
         peer.reset(bios_handoff=True)
         Counting.pumps = 0
-        pa, _pb = ListPipe.pair()
+        pa, pb = ListPipe.pair()
         FRAMES = 10
         # The input delay pre-fills that many frames of both streams, so this session
-        # can run on its own without a peer answering.
+        # can run on its own once the peer has said hello -- and only then: a session
+        # never plays a frame before the peer's session hello (MirrorSession.step).
         sess = MirrorSession(local, peer, Counting(local, peer), pa,
                              Handshake(rom_hash="r", bios_hash="b", core_version="c",
                                        delay=FRAMES + 2, host=True))
+        _say_hello(pb, delay=FRAMES + 2)
         relays_before = local.link_relay_count()
         for _ in range(FRAMES):
             assert sess.step(0) == "ran"
@@ -707,10 +747,11 @@ def test_the_mirrors_own_cable_is_stepped_like_a_cable():
         # whole-frame path -- two pumps a frame. Without it, "many pumps" could just
         # mean "many frames".
         Counting.pumps = 0
-        fake = MirrorSession(FakeMachine(), FakeMachine(), Counting(local, peer),
-                             ListPipe.pair()[0],
+        fa, fb = ListPipe.pair()
+        fake = MirrorSession(FakeMachine(), FakeMachine(), Counting(local, peer), fa,
                              Handshake(rom_hash="r", bios_hash="b", core_version="c",
                                        delay=FRAMES + 2, host=True))
+        _say_hello(fb, delay=FRAMES + 2)
         for _ in range(FRAMES):
             assert fake.step(0) == "ran"
         assert Counting.pumps == FRAMES * 2, "the fallback should pump twice a frame"
@@ -754,11 +795,30 @@ def test_two_mirrored_pcs_stay_identical_and_keep_full_speed(wire_delay):
     pc1, pc2 = one_pc(pa, True), one_pc(pb, False)
     try:
         ran = 0
+        lost_in_play = 0
         for i in range(240):
             # player 1 holds RIGHT, player 2 holds UP -- distinct bits, so a console
             # that received the wrong stream is visible rather than plausible.
-            ran += (pc1.step(0x08) == "ran") + (pc2.step(0x01) == "ran")
-        assert ran == 480, f"the wire cost frames: {ran}/480 ran"
+            for pc, pad in ((pc1, 0x08), (pc2, 0x01)):
+                greeted = pc.greeted
+                r = pc.step(pad)
+                ran += r == "ran"
+                lost_in_play += greeted and r == "waiting"
+        # ⚡ The ONE thing a wire may cost is the trip of the peer's session hello at the
+        # start: a session plays no frame before it (MirrorSession.step). After it, not
+        # a single frame.
+        assert lost_in_play == 0, f"the wire cost {lost_in_play} frames mid-match"
+        assert ran >= 480 - 2 * (wire_delay + 1), f"the wire cost frames: {ran}/480 ran"
+        # The two hellos land a wire apart, so the PCs may stop a frame apart: bring
+        # the one behind to the same frame before comparing memory, or a frame counter
+        # in RAM reads as a desync.
+        for _ in range(4 * (wire_delay + 2)):
+            if pc1.frames_run == pc2.frames_run:
+                break
+            behind, pad = ((pc1, 0x08) if pc1.frames_run < pc2.frames_run
+                           else (pc2, 0x01))
+            behind.step(pad)
+        assert pc1.frames_run == pc2.frames_run
 
         # PC1's own console and PC2's mirror of it are the same console, twice.
         assert pc1.local.read(0x4000, 0x2C00) == pc2.peer.read(0x4000, 0x2C00)
@@ -798,7 +858,7 @@ def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app):
         sh.play.start(ROM)
         sh.play.held = 0x08                      # this player holds RIGHT
         sh._begin_mirror(SocketPipe(s1), host=True)
-        _bring_up(sh, s2, sh.play.session._rom)
+        far_trade = _bring_up(sh, s2, sh.play.session._rom)
         assert sh.play.link_mode() == "mirror"
 
         # The other PC, built the way _begin_mirror builds its pair: same cartridge
@@ -835,7 +895,11 @@ def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app):
                             Handshake(rom_hash=near.hs.rom_hash,
                                       bios_hash=near.hs.bios_hash,
                                       core_version=near.hs.core_version,
-                                      delay=near.delay, host=False))
+                                      delay=near.delay, host=False),
+                            # ⚠️ What the trade read past its end -- the near session's
+                            # hello among it -- exactly as Shell._pump_mirror_bringup
+                            # hands it over. Dropped, the far side waits for ever.
+                            far_trade.leftover)
 
         for _ in range(400):
             sh.play._tick()
@@ -1140,7 +1204,7 @@ def test_the_debugger_tap_reaches_the_mirror_cable(sh, app):
     try:
         sh.play.start(ROM)
         sh._begin_mirror(SocketPipe(s1), host=True)
-        _bring_up(sh, s2, sh.play.session._rom)
+        _far_says_hello(_bring_up(sh, s2, sh.play.session._rom))
         mon = LinkMonitor()
         sh.play.set_link_monitor(mon)
         # ⛔ As a COUNTER, not as `monitor_a`: a monitor reroutes how this PC steps the
@@ -1189,7 +1253,7 @@ def test_the_two_players_may_hold_DIFFERENT_cartridges(sh, app):
         assert theirs != mine
 
         sh._begin_mirror(SocketPipe(s1), host=True)
-        _bring_up(sh, s2, theirs)
+        _far_says_hello(_bring_up(sh, s2, theirs))
         assert sh.play._mirror is not None, "a different cartridge was refused"
 
         # the mirror console really holds THEIR cartridge, not a copy of ours

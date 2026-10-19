@@ -747,6 +747,20 @@ class MirrorSession:
         self._drain()
         if self.rejected:
             return "rejected"
+        # ⚡ NOT ONE FRAME BEFORE THE PEER'S SESSION HELLO. Whoever finishes the cartridge
+        # trade first used to start alone: it played its `delay` pre-filled frames, then
+        # froze until the other PC's session existed. MEASURED (two headless bots, an
+        # 80 ms line, Ngpcraft_netplay_bench): the joiner started 0.37-0.50 s early, froze
+        # ~0.4 s, and that freeze landed in its FIRST round trip (425-535 ms instead of 80)
+        # -- its delay jumped to 14-18 frames and came down one frame every 10 s. Worse, it
+        # then ran 2-5 frames AHEAD of the host for the whole match, with no slack left:
+        # every hiccup of the line became a freeze on its screen and none on the host's
+        # (3 % loss: 85 freezes >= 100 ms a minute against 0). Waiting for the hello costs
+        # one one-way trip once; with it: delay max 18 -> 7, those freezes 85 -> 7.
+        # (Proposed by Blueteemo, Tixul/Ngpcraft_emulator PR #26.) Every build sends its
+        # hello first thing, so an older peer is waited for just the same.
+        if not self.greeted:
+            return "waiting"
         # Our own input is scheduled for a frame in the future, and played when that
         # frame comes round -- the SAME delay the peer's input gets, so both PCs
         # simulate identical input streams.
