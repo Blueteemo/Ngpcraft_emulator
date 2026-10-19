@@ -31,7 +31,7 @@ import tempfile
 import time
 from pathlib import Path
 
-DEFAULT_REPO = Path(r"C:\Users\wilfr\Documents\GitHub\Ngpcraft_emulator")
+DEFAULT_REPO = Path(__file__).resolve().parents[2]   # this port lives inside the desktop repo
 
 G_LAST_RX = 0x400A
 G_RX_TOTAL = 0x400C

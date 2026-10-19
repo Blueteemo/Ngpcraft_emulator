@@ -1608,3 +1608,69 @@ def test_opening_the_debugger_on_ONE_pc_mid_match_does_not_desync_the_other():
     finally:
         for s in (pc1, pc2):
             s.local.close(); s.peer.close()
+
+
+# --------------------------------------------------------------------------- #
+# The UDP companion: the inputs also go by datagram, sixteen at a time.
+# --------------------------------------------------------------------------- #
+def _udp_pair(tcp_lag: int, with_udp: bool):
+    """Two sessions whose 'TCP' is a ListPipe `tcp_lag` pumps late -- what one lost
+    segment does to everything behind it -- with or without a real UDP side each."""
+    pa, pb = ListPipe.pair(tcp_lag)
+    socks = []
+    if with_udp:
+        for pipe in (pa, pb):
+            u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            u.bind(("127.0.0.1", 0))
+            socks.append(u)
+            pipe.udp = netplay.UdpSide(u, peer_ip="127.0.0.1")
+    kw = dict(rom_hash="R", bios_hash="B", core_version="C", delay=3)
+    a = MirrorSession(FakeMachine(1), FakeMachine(1), FakeLink(), pa, Handshake(host=True, **kw))
+    b = MirrorSession(FakeMachine(1), FakeMachine(1), FakeLink(), pb, Handshake(host=False, **kw))
+    return a, b, socks
+
+
+def test_udp_carries_the_inputs_while_tcp_is_held_back():
+    """⚡ THE POINT OF THE UDP SIDE. A TCP stream stuck behind a retransmission delivers
+    every later input late; the datagrams, each carrying the last 16 inputs, do not wait.
+    Without them this pair stalls on most frames; with them it barely stalls -- and both
+    PCs still play the very same two input streams."""
+    import time as _t
+    results = {}
+    for with_udp in (False, True):
+        a, b, socks = _udp_pair(tcp_lag=30, with_udp=with_udp)
+        try:
+            for i in range(400):
+                a.step(0x10 if i % 7 else 0x01)
+                b.step(0x20 if i % 5 else 0x02)
+                if with_udp:
+                    _t.sleep(0.0005)         # let loopback datagrams land
+            assert _same_streams(a, b), "the two PCs played different inputs"
+            results[with_udp] = (a.frames_run, b.frames_run)
+            if with_udp:
+                assert a.udp.useful > 0 and b.udp.useful > 0
+        finally:
+            for u in socks:
+                u.close()
+    slow, fast = results[False], results[True]
+    assert min(fast) > 300, f"UDP did not carry the session: {fast} frames of 400"
+    assert min(fast) > 2 * max(slow), f"no gain: without {slow}, with {fast}"
+
+
+def test_a_datagram_without_our_token_is_ignored():
+    """Nobody but the peer on the TCP connection may put a button in."""
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    u.bind(("127.0.0.1", 0))
+    side = netplay.UdpSide(u, peer_ip="127.0.0.1")
+    intruder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        port = u.getsockname()[1]
+        bad = netplay._UDP_HDR.pack(netplay.UDP_MAGIC, b"\x00" * 8, 5, 2) + b"\x10\x10"
+        good = netplay._UDP_HDR.pack(netplay.UDP_MAGIC, side.token, 5, 2) + b"\x10\x20"
+        intruder.sendto(bad, ("127.0.0.1", port))
+        intruder.sendto(good, ("127.0.0.1", port))
+        import time as _t
+        _t.sleep(0.05)
+        assert side.recv() == [(5, 0x10), (6, 0x20)]
+    finally:
+        u.close(); intruder.close()

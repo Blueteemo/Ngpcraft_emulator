@@ -5524,6 +5524,7 @@ class _NetConnect(QThread):
 
     connected = pyqtSignal(object)     # a connected socket.socket
     failed = pyqtSignal(str)           # already-translated, player-facing
+    upnp = pyqtSignal(bool, str)       # host only: port opened on the box?, its WAN IP
 
     # ⛔ CINQ MINUTES N'ETAIENT PAS « GENEREUSES », C'ETAIT LA PANNE.
     #
@@ -5556,6 +5557,7 @@ class _NetConnect(QThread):
         self._lang = lang
         self._srv = None
         self._cancel = threading.Event()
+        self.upnp_udp = None        # a still-open UDP rule, handed to the shell
 
     # ---- the two ways in ---------------------------------------------------
     def _accept(self):
@@ -5563,12 +5565,23 @@ class _NetConnect(QThread):
         second instead of never."""
         import select
         import socket
+        from core import upnp
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        mapping = None
         try:
             srv.bind(("0.0.0.0", self._port))
             srv.listen(1)
             self._srv = srv
+            # ⚡ ASK THE BOX TO OPEN THE PORT, AFTER LISTENING (a peer may already be
+            # dialling) and only for this attempt: `finally` closes it once someone is
+            # in -- an established connection needs no inbound rule -- or on cancel.
+            # MEASURED (core/upnp.py): a hand-made router rule let nothing in, the
+            # same port asked for by UPnP carried a five-minute match.
+            # UDP too: mirror play sends its inputs both ways (core/netplay.UdpSide).
+            mapping = upnp.open_port(self._port, protocols=("TCP", "UDP"))
+            self.upnp.emit(mapping is not None,
+                           mapping.external_ip if mapping is not None else "")
             deadline = time.monotonic() + self.HOST_TIMEOUT_S
             while not self._cancel.is_set():
                 if time.monotonic() >= deadline:
@@ -5584,6 +5597,12 @@ class _NetConnect(QThread):
                         if self._cancel.is_set():
                             break
                         conn, _ = srv.accept()
+                        # The UDP rule outlives the attempt: a mirror session receives
+                        # the peer's datagrams for as long as it runs. The shell closes
+                        # it with the session (`upnp_udp`); the box's lease is the net.
+                        if mapping is not None and "UDP" in mapping.protocols:
+                            mapping.close("TCP")
+                            self.upnp_udp, mapping = mapping, None
                         return conn
                 except OSError:
                     if not self._cancel.is_set():
@@ -5596,6 +5615,8 @@ class _NetConnect(QThread):
                 srv.close()
             except OSError:
                 pass
+            if mapping is not None:
+                mapping.close()
 
     def _dial(self):
         """Connect, retrying while the host is not listening yet."""
@@ -5919,6 +5940,8 @@ class Shell(QMainWindow):
         self._net_status = None            # online link diagnostic timer
         self._net_clock = None             # « en attente » qui COMPTE, voir _start_net
         self._host_info = None             # the host connection-info dialog
+        self._upnp_state: tuple[bool, str] | None = None   # did the box open the port?
+        self._udp_rule = None              # the box's UDP rule kept for a mirror session
         self.settings.changed.connect(self._on_settings_changed)
         self.settings.storage_changed.connect(self._on_storage_changed)
         self.settings.scale_changed.connect(self.play.set_window_scale)
@@ -6415,6 +6438,8 @@ class Shell(QMainWindow):
         th = _NetConnect(mode, host, port, lang)
         th.connected.connect(self._on_net_connected)
         th.failed.connect(self._on_net_failed)
+        th.upnp.connect(self._on_net_upnp)
+        self._upnp_state = None
         th.finished.connect(lambda t=th: self._on_net_thread_finished(t))
         self._net_thread = th
         self.play.net_pending = True
@@ -6539,7 +6564,18 @@ class Shell(QMainWindow):
         self._host_info = HostInfoDialog(game, int(port),
                                          cfg.language(self._settings), self)
         self._host_info.finished.connect(self._on_host_info_closed)
+        if self._upnp_state is not None:          # the box answered before the panel
+            self._host_info.set_upnp(*self._upnp_state)
         self._host_info.show()
+
+    def _on_net_upnp(self, opened: bool, external_ip: str) -> None:
+        """The hosting worker asked the box to open the port (core/upnp.py). Kept,
+        because the answer can land before the address panel exists."""
+        if not self._from_current_worker():
+            return
+        self._upnp_state = (bool(opened), str(external_ip))
+        if self._host_info is not None:
+            self._host_info.set_upnp(*self._upnp_state)
 
     def _on_host_info_closed(self, *_a) -> None:
         """Le panneau d'adresse se ferme. L'HEBERGEMENT CONTINUE.
@@ -6588,11 +6624,23 @@ class Shell(QMainWindow):
             return
         self._stop_net_clock()       # relie: plus rien a compter
         self._close_host_info()      # the panel answered its question: they are in
+        worker = self.sender()
+        udp_rule = getattr(worker, "upnp_udp", None)
+        if worker is not None:
+            worker.upnp_udp = None   # ours now, whatever happens next
         if self._mirror_pending is not None:        # the other online mode
-            from core.netplay import SocketPipe
+            from core.netplay import SocketPipe, open_udp
             mode, self._mirror_pending = self._mirror_pending, None
-            self._begin_mirror(SocketPipe(sock), host=(mode == "host"))
+            # ⚡ The inputs also go by UDP (core/netplay.UdpSide): a lost TCP segment no
+            # longer freezes both PCs until it is retransmitted. The box's UDP rule, if
+            # UPnP opened one, lives as long as this session (`_release_udp_rule`).
+            self._release_udp_rule()
+            self._udp_rule = udp_rule
+            self._begin_mirror(SocketPipe(sock, udp=open_udp(sock, host=(mode == "host"))),
+                               host=(mode == "host"))
             return
+        if udp_rule is not None:
+            udp_rule.close()         # the cable mode has no use for UDP
         if self.play.machine is None:
             try: sock.close()
             except OSError: pass
@@ -6902,8 +6950,17 @@ class Shell(QMainWindow):
         self._net_status.timeout.connect(_titre)
         self._net_status.start(500)
 
+    def _release_udp_rule(self) -> None:
+        """Close the box's UDP rule a mirror session was using, if UPnP opened one."""
+        rule, self._udp_rule = getattr(self, "_udp_rule", None), None
+        if rule is not None:
+            import threading
+            # A SOAP call to the box can take seconds: never on the Qt thread.
+            threading.Thread(target=rule.close, name="upnp-close", daemon=True).start()
+
     def _on_mirror_ended(self, why: str) -> None:
         self._end_mirror_bringup()      # a trade still running belongs to this session
+        self._release_udp_rule()
         self.play.detach_mirror()
         if self._net_status is not None:
             self._net_status.stop(); self._net_status = None
@@ -7062,6 +7119,14 @@ class Shell(QMainWindow):
         if self._debug_win is not None:
             self._debug_win.close()
         self._shutdown_net()      # a host/join still searching must not outlive us
+        # The box's UDP rule of a running mirror session: closed HERE, synchronously --
+        # a daemon thread would die with the process before the box heard it.
+        rule, self._udp_rule = getattr(self, "_udp_rule", None), None
+        if rule is not None:
+            try:
+                rule.close()
+            except Exception:  # noqa: BLE001 -- quitting; the lease is the net
+                pass
         self.play.stop()
         self.library._stop_worker()
         self._settings.sync()

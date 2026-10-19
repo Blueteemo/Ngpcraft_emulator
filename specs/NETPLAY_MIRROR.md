@@ -97,6 +97,39 @@ frame has not arrived — the caller must not advance anything else either) or
 `"rejected"`. It never invents a button: a guess would desync the two PCs silently,
 which is the one failure this design exists to avoid.
 
+### 3d. The inputs also go by UDP — next to TCP, not instead of it (2026-10-19)
+
+One lost TCP segment holds back everything behind it until it is retransmitted
+(head-of-line blocking), so on a line that loses packets both PCs freeze together while
+an input that is already late is sent again. `core.netplay.UdpSide` adds a datagram per
+frame carrying the sender's **last 16 scheduled inputs**:
+
+```
+[magic "NGU1":4][receiver's token:8][first frame:4 LE][count:1][count pad bytes]
+```
+
+* **TCP is untouched**: every input still travels there, in order. A peer without UDP
+  (an older build, the lobby relay, a firewall) plays exactly as before, and there is no
+  protocol version bump — the session hello simply carries one more JSON field,
+  `"udp": {"port": P, "tok": "<16 hex>"}`, which older builds ignore.
+* An input is a fact about a frame: getting it twice, or by both paths, changes nothing.
+  One that lands for a frame already played is **dropped** — on both paths: the TCP copy
+  of an input that UDP delivered first would otherwise be stored for ever (a slow leak).
+* A datagram must carry the token the **receiver** announced, so nobody but the peer of
+  the TCP connection can put a button in.
+* The host binds UDP on the **same port number** as its TCP listener; the joiner takes
+  any port and announces it. The real address is taken from the first valid datagram,
+  because behind a NAT the announced port is not the one the box uses.
+* Sent every frame, **waiting or not**: a stalled pair is exactly when the peer needs
+  the copy TCP is holding back.
+
+Measured (an out-of-tree bench: two headless mirror bots, six games in real link
+fights, 80 ms round trip, 3 % loss, 150 s): freezes ≥ 100 ms per game, host / joiner,
+**6-16 / 7-16 → 0 / 2-4** (what remains is the start-up wait of §4.0 and one machine-wide
+hitch common to all six runs); the host's worst freeze 148-366 ms → 3-18 ms; speed
+0.98 → 0.995. Over the real Internet (home PC ↔ GitHub runner, 125 ms): ~10 800
+datagrams each way, UDP delivered most inputs before their TCP copy.
+
 ### 3a. BYE — a refusal is not a hang-up
 
 Refusing used to mean closing the socket. A TCP socket closed with **unread data in
@@ -165,6 +198,16 @@ An armed link monitor keeps the host-side relay, as does `NGPCRAFT_HOST_RELAY=1`
 ## 4. The rules that are NOT optional
 
 Each was a measured desync before it was a rule.
+
+0. **No frame before the peer's SESSION hello** (2026-10-19, `MirrorSession.step`). The
+   side that finishes the cartridge trade first used to start alone, play its pre-filled
+   frames, then freeze until the other session existed. Not a desync — a lag: MEASURED on
+   an 80 ms line, the early side froze ~0.4 s, that freeze landed in its FIRST round
+   trip (425-535 ms, up to 818), its input delay jumped to 14-20 frames and came down one
+   frame every 10 s. Waiting for the hello costs one one-way trip, once; the delay then
+   stays where the line puts it (7-10 frames on that line). Every build sends its hello
+   first thing, so an older peer is waited for just the same. (Proposed by Blueteemo,
+   PR #26.)
 
 1. **Player 1's console runs FIRST, on both PCs** — not "ours first". Each console's
    frame is followed by a relay, so which one runs first decides whether a byte
@@ -292,6 +335,16 @@ Two ways in, and they end in the same session:
   **the joiner adopts the host's** rather than its own setting. The listing shows 🔗 or
   🪞 per room.
 
+⚡ **Hosting opens the port by itself** (2026-10-19, `core/upnp.py`): after listening, the
+host worker asks the box by UPnP for TCP **and** UDP on that port, and the host panel
+says whether it worked. The TCP rule is removed as soon as the peer is in (an
+established connection needs no inbound rule); the UDP rule is handed to the `Shell`
+(`_udp_rule`) and removed when the mirror session ends or the emulator quits, with a
+two-hour lease as the safety net. MEASURED on a common ISP router: a hand-made NAT rule let
+nothing in, the same port asked for by UPnP carried a five-minute match. A box without
+UPnP falls back to the manual instructions; `NGPCRAFT_NO_UPNP=1` turns it off (the test
+suite sets it, so it never touches the developer's router).
+
 `core.lobby.LobbyPipe` presents the relay as a `Pipe`. It carries `lost` because the
 lobby loses a peer through a **Qt signal**, not a socket error, and a session never told
 would sit at "waiting for the other player" for ever. `Shell._begin_mirror` therefore
@@ -342,5 +395,17 @@ Fighters' Clash SNK + Capcom: trade plus 600 frames, no desync, no exception. Wo
 rebuilding when the bring-up changes.
 
 ✅ **Played on two real PCs over a LAN, 2026-08-04** — the first mirror session outside
-a bench. Still unproven by hand: the open internet, the lobby transport, and a long
-match (a desync has time to appear).
+a bench.
+
+🤖 **2026-10-19 — the bench without players** (an out-of-tree test bench):
+a headless bot replays exactly `_begin_mirror` / `_start_mirror` / `_step_mirror`, with
+the shell's own pacing (audio-paced: time lost to a wait is FORGOTTEN, not caught up — a
+bot that caught up invented an asymmetry the product does not have). Two bots play
+over Linux `netem` (delay, loss) or the real Internet (a GitHub runner joins the home
+PC). Menu paths found by LOOKING at both screens (`tools/explore.py`) take six games into
+real link fights: Fatal Fury, Match of the Millennium, Samurai Shodown! 2, The Last
+Blade, Gals' Fighters, KOF R-2. Results: **no desync anywhere** — 18 games in solo
+play, the six in link fights at 1 % and 3 % loss, and Fatal Fury / MOTM (its 4 MiB cart
+traded) over the Internet at 125-195 ms; a Windows core against a Linux one stays
+byte-identical. Still unproven: the lobby transport, Card Fighters' Clash (its VERSUS
+menu needs a saved game in the image), the non-fighting link games.

@@ -51,6 +51,8 @@ tests drive it with a pair of lists.
 from __future__ import annotations
 
 import json
+import os
+import socket
 import struct
 import time
 import zlib
@@ -218,6 +220,120 @@ class ListPipe:
         return bytes(out)
 
 
+# ⚡ THE INPUTS ALSO TRAVEL BY UDP, SIXTEEN AT A TIME -- NEXT TO TCP, NOT INSTEAD OF IT.
+#
+# ⛔ WHAT TCP COSTS ON A LINE THAT LOSES PACKETS. One lost segment holds back everything
+# behind it until it is retransmitted (head-of-line blocking): every input of the next
+# few hundred ms waits for one that is already late, and both PCs freeze together.
+# MEASURED (out-of-tree bench, two headless mirror bots, 80 ms round trip, six link games
+# in real link fights): 1 % loss = 0-8 freezes >= 100 ms per 150 s, 3 % loss = 8-22.
+# Nothing is wrong with the session: that is TCP being reliable the slow way.
+#
+# 🔑 Every datagram carries the sender's LAST 16 scheduled inputs, each tagged with its
+# frame number. A lost one is simply covered by the next -- no ack, no retransmit, no
+# waiting. The homebrew that plays online over a Wi-Fi link adapter (Schneeball) does
+# the same thing with its state packet, repeated whole every four frames.
+#
+# Why it cannot hurt:
+#   * the TCP stream is untouched -- every input still goes there too, in order, so a
+#     peer without UDP (older build, the lobby relay, a firewall) plays exactly as before;
+#   * an input is a fact about a frame, not an event: getting it twice, or by both
+#     paths, changes nothing, and one that arrives for a frame already played is dropped;
+#   * a datagram must carry the token the RECEIVER announced in its session hello, so
+#     nobody but the peer on the TCP connection can put a button in.
+UDP_MAGIC = b"NGU1"
+UDP_REDUNDANCY = 16
+_UDP_HDR = struct.Struct("<4s8sIB")      # magic, receiver's token, first frame, count
+
+
+class UdpSide:
+    """The UDP companion of one mirror session's TCP connection."""
+
+    def __init__(self, sock, peer_ip: str = "", peer_port: int = 0) -> None:
+        self.sock = sock
+        self.sock.setblocking(False)
+        self.token = os.urandom(8)            # what the peer must stamp on its datagrams
+        self.peer_token: bytes | None = None   # what we must stamp on ours
+        self.peer: tuple[str, int] | None = (peer_ip, peer_port) if peer_port else None
+        self._peer_ip = peer_ip
+        self.sent = 0
+        self.received = 0
+        self.useful = 0                        # inputs that UDP delivered first
+
+    def announce(self) -> dict:
+        return {"port": self.sock.getsockname()[1], "tok": self.token.hex()}
+
+    def learn(self, info) -> None:
+        """Take the peer's half from its session hello."""
+        if not isinstance(info, dict):
+            return
+        try:
+            self.peer_token = bytes.fromhex(str(info.get("tok", "")))
+            port = int(info.get("port", 0))
+        except (ValueError, TypeError):
+            return
+        if len(self.peer_token) != 8:
+            self.peer_token = None
+            return
+        if self.peer is None and port and self._peer_ip:
+            self.peer = (self._peer_ip, port)
+
+    def send(self, first: int, pads: bytes) -> None:
+        if self.peer is None or self.peer_token is None or not pads:
+            return
+        try:
+            self.sock.sendto(_UDP_HDR.pack(UDP_MAGIC, self.peer_token, first & 0xFFFFFFFF,
+                                           len(pads)) + pads, self.peer)
+            self.sent += 1
+        except OSError:
+            pass                               # a full buffer or an unreachable port: TCP has it
+
+    def recv(self) -> list[tuple[int, int]]:
+        got: list[tuple[int, int]] = []
+        while True:
+            try:
+                data, addr = self.sock.recvfrom(512)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break                          # e.g. Windows' ICMP "port unreachable" echo
+            if len(data) < _UDP_HDR.size:
+                continue
+            magic, tok, first, n = _UDP_HDR.unpack_from(data, 0)
+            if magic != UDP_MAGIC or tok != self.token or len(data) < _UDP_HDR.size + n:
+                continue
+            # The address it really came from: behind a NAT the port the peer announced
+            # is not the one its box uses, and this is how the answer finds its way back.
+            self.peer = addr
+            self.received += 1
+            pads = data[_UDP_HDR.size:_UDP_HDR.size + n]
+            got.extend((first + i, pads[i]) for i in range(n))
+        return got
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def open_udp(tcp_sock, host: bool) -> "UdpSide | None":
+    """The UDP side for a direct mirror connection, or None if it cannot be had.
+
+    The host listens on the SAME port number as its TCP listener (the one the joiner
+    dialled, and the one UPnP opens for both protocols); the joiner takes any port and
+    learns the host's from its hello.
+    """
+    try:
+        peer_ip = tcp_sock.getpeername()[0]
+        local_port = tcp_sock.getsockname()[1]
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.bind(("0.0.0.0", local_port if host else 0))
+    except OSError:
+        return None
+    return UdpSide(u, peer_ip=peer_ip)
+
+
 class SocketPipe:
     """A TCP socket as a Pipe. Non-blocking, and it never loses a byte.
 
@@ -228,11 +344,20 @@ class SocketPipe:
     stream that loses a byte does not degrade -- it desyncs.
     """
 
-    def __init__(self, sock) -> None:
+    def __init__(self, sock, udp: "UdpSide | None" = None) -> None:
         self.sock = sock
         self.sock.setblocking(False)
         self._out = bytearray()
         self.lost: str | None = None
+        self.udp = udp              # optional companion for the inputs (see UdpSide)
+
+    def close(self) -> None:
+        for thing in (self.sock, self.udp):
+            if thing is not None:
+                try:
+                    thing.close()
+                except OSError:
+                    pass
 
     @property
     def pending(self) -> int:
@@ -332,6 +457,7 @@ class Handshake:
             from core.native import active_timing_model
             timing = active_timing_model()
         self.timing = timing
+        self.udp_info: dict | None = None      # our UDP side, announced in the hello
         # ⚡ SETTINGS THAT SHAPE THE SENDER'S OWN CONSOLE -- announced, like the
         # cartridge, and for the same reason.
         #
@@ -357,6 +483,7 @@ class Handshake:
             "v": PROTOCOL_VERSION, "rom": self.rom_hash, "bios": self.bios_hash,
             "core": self.core_version, "delay": self.delay, "cons": self.console,
             "timing": self.timing,
+            **({"udp": self.udp_info} if self.udp_info else {}),
         }, sort_keys=True).encode("utf-8")
 
     def check(self, raw: bytes) -> str | None:
@@ -640,6 +767,13 @@ class MirrorSession:
         self.frames_run = 0
         self.bytes_out = 0
         self.bytes_in = 0
+        # The optional UDP companion (UdpSide): announced in our hello, used once the
+        # peer's hello has told us its own half. `_sent_hist` keeps our last scheduled
+        # inputs, because the peer may still need ones we have already played.
+        self.udp = getattr(pipe, "udp", None)
+        self._sent_hist: deque[tuple[int, int]] = deque(maxlen=UDP_REDUNDANCY)
+        if self.udp is not None:
+            self.hs.udp_info = self.udp.announce()
         js = self.hs.payload()
         self._send(_T_HELLO, 0, struct.pack("<H", len(js)) + js)
 
@@ -669,6 +803,13 @@ class MirrorSession:
         # would stay here exactly when the peer is waiting for it. Two stalled sides
         # that both stop flushing never restart each other.
         _flush(self.pipe)
+        if self.udp is not None:
+            for f, pad in self.udp.recv():
+                # Only frames still to be played; the TCP copy of the same input, when it
+                # lands, writes the same byte.
+                if f >= self.frame and f not in self.peer_inputs:
+                    self.peer_inputs[f] = pad
+                    self.udp.useful += 1
         chunk = self.pipe.recv()
         if chunk:
             self._rx += chunk
@@ -692,7 +833,10 @@ class MirrorSession:
             body = bytes(self._rx[_HDR.size:_HDR.size + need])
             del self._rx[:_HDR.size + need]
             if kind == _T_INPUT:
-                self.peer_inputs[frame] = body[0]
+                # ⚠️ With the UDP copy the TCP one can land AFTER its frame was played;
+                # stored then, it would never be popped -- a slow leak for the session.
+                if frame >= self.frame:
+                    self.peer_inputs[frame] = body[0]
             elif kind == _T_CHECK:
                 somme, leur_ts, echo = _CHECK_BODY.unpack(body)
                 self._checks[frame] = somme
@@ -719,6 +863,11 @@ class MirrorSession:
                 why = self.hs.check(body[2:])
                 if why:
                     self._reject(why)
+                elif self.udp is not None:
+                    try:
+                        self.udp.learn(json.loads(body[2:].decode("utf-8")).get("udp"))
+                    except (ValueError, UnicodeDecodeError, AttributeError):
+                        pass
 
     # --- state ---------------------------------------------------------------
     def checksum(self) -> int:
@@ -750,7 +899,7 @@ class MirrorSession:
         # ⚡ NOT ONE FRAME BEFORE THE PEER'S SESSION HELLO. Whoever finishes the cartridge
         # trade first used to start alone: it played its `delay` pre-filled frames, then
         # froze until the other PC's session existed. MEASURED (two headless bots, an
-        # 80 ms line, Ngpcraft_netplay_bench): the joiner started 0.37-0.50 s early, froze
+        # 80 ms line, out-of-tree bench): the joiner started 0.37-0.50 s early, froze
         # ~0.4 s, and that freeze landed in its FIRST round trip (425-535 ms instead of 80)
         # -- its delay jumped to 14-18 frames and came down one frame every 10 s. Worse, it
         # then ran 2-5 frames AHEAD of the host for the whole match, with no slack left:
@@ -771,7 +920,12 @@ class MirrorSession:
         for f in range(self._sched_to + 1, at + 1):
             self.local_inputs[f] = pad & 0xFF
             self._send(_T_INPUT, f, bytes([pad & 0xFF]))
+            self._sent_hist.append((f, pad & 0xFF))
         self._sched_to = max(self._sched_to, at)
+        if self.udp is not None and self._sent_hist:
+            # Every frame, waiting or not: a stalled pair is exactly when the peer
+            # needs the copy that TCP is holding back.
+            self.udp.send(self._sent_hist[0][0], bytes(p for _, p in self._sent_hist))
         if self.frame not in self.peer_inputs:
             self.stalls += 1
             return "waiting"

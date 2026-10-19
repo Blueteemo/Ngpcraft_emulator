@@ -19,7 +19,7 @@ import os
 # Le corpus n'est pas dans le depot : chemin par variable d'environnement,
 # avec un defaut local. Les ROMs manquantes sont SIGNALEES, pas ignorees en
 # silence -- un balayage qui n'a rien teste ne doit pas dire « ok ».
-ROMS = Path(os.environ.get("NGPCRAFT_ROMS", r"C:/Users/wilfr/Desktop/NGPC_RAG/jeux officiel"))
+ROMS = Path(os.environ.get("NGPCRAFT_ROMS", str(Path(__file__).resolve().parent.parent / "roms")))
 MEM = ngpc_native.SHELL_MEM_LEN
 
 def blob(m):

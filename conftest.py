@@ -65,6 +65,11 @@ def pytest_configure(config):  # noqa: ANN001, ARG001
     """
     os.environ[cfg_env()] = str(
         Path(tempfile.mkdtemp(prefix="ngpcraft-tests-")) / "settings.ini")
+    # ⛔ AND KEEP THE SUITE OFF THE REAL ROUTER. Hosting a direct game asks the box to
+    # open its port by UPnP (core/upnp.py); dozens of tests host one, so without this
+    # the suite would punch holes in the developer's own box -- and pay the discovery
+    # timeout on every hosting test of a CI machine that has no box at all.
+    os.environ["NGPCRAFT_NO_UPNP"] = "1"
 
 
 def cfg_env() -> str:

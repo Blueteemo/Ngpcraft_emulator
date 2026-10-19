@@ -621,6 +621,14 @@ player toolbar's **🔗** button:
   message says *which* thing failed — nobody listening, a name that does not resolve, a port
   already taken, a firewall — instead of an error number.
 
+  🔓 **The emulator opens the port on your router by itself (UPnP)** while you host — TCP,
+  and UDP for mirror play — and the host panel tells you whether it could. The rules are
+  removed again once the other player is in (UDP: when the mirror match ends). On a box
+  without UPnP, or with it switched off, forward the port by hand as the panel explains
+  (TCP **and** UDP, same number). Measured on a common ISP router: a hand-made forward let
+  nothing in, the same port opened by UPnP carried a five-minute match. Set
+  `NGPCRAFT_NO_UPNP=1` if you do not want the emulator to touch your router.
+
   ⚠️ **If nothing gets through at all, it is almost never the emulator: it is the inbound
   connection.** Behind a router with no port forward — or behind carrier-grade NAT, where no
   forward is even possible — nothing can reach you, whatever you click. Use the **online
@@ -641,6 +649,13 @@ player toolbar's **🔗** button:
   decide how the code runs; it refuses to start otherwise, since a mismatch does not
   fail loudly, it drifts. Savestates, rewind and reset are refused during a mirror match
   for the same reason.
+
+  📡 **On a connection that loses packets**, mirror play also sends your last 16 inputs in
+  a small UDP packet every frame, next to the normal connection: a lost packet is covered
+  by the next one instead of freezing both screens while it is sent again. Measured with
+  six link fighting games at 3 % packet loss: freezes over a tenth of a second went from
+  6-16 per 2½ minutes to none on the host's side. If UDP cannot get through (a firewall,
+  an older version on the other PC, the lobby), the match simply plays as before.
 
   ⚠️ **"Same build" means the same .exe on both PCs** — compare the file's date, not a
   version shown anywhere. The check behind it inspects the emulation core, and two builds

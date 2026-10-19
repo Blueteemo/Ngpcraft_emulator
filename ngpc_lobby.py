@@ -158,6 +158,11 @@ class HostInfoDialog(QDialog):
         self._pub_lbl = QLabel(self._t("host_wan_detecting"))
         self._pub_lbl.setTextFormat(Qt.TextFormat.RichText)
         v.addWidget(self._pub_lbl)
+        # Whether the box opened the port by itself (UPnP, asked by the hosting worker).
+        self._upnp_lbl = QLabel(self._t("host_upnp_trying"))
+        self._upnp_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._upnp_lbl.setWordWrap(True)
+        v.addWidget(self._upnp_lbl)
 
         v.addWidget(QLabel(self._t("host_share")))
         self._paste = QLineEdit(); self._paste.setReadOnly(True)
@@ -193,6 +198,17 @@ class HostInfoDialog(QDialog):
             self._paste.setText(self._line(ip))
         else:
             self._pub_lbl.setText(self._t("host_wan_none"))
+
+    def set_upnp(self, opened: bool, external_ip: str = "") -> None:
+        """What the box said when asked to open the port. When it did, the manual
+        forwarding explained below is not needed any more -- and its WAN address is the
+        one to share, read from the box itself rather than from a web service."""
+        if opened:
+            self._upnp_lbl.setText(self._t("host_upnp_ok").format(port=self._port))
+            if external_ip and not self._pub:
+                self._on_public_ip(external_ip)
+        else:
+            self._upnp_lbl.setText(self._t("host_upnp_none").format(port=self._port))
 
     def _copy(self) -> None:
         QApplication.clipboard().setText(self._paste.text())

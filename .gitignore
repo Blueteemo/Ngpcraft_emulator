@@ -55,3 +55,12 @@ system_ram.bin
 *.pdb
 *.exp
 *.lib
+
+# Personal runtime settings (paths of the developer's own machine) -- never shared.
+/config.ini
+/settings_backup*.ini
+# Debug dumps left at the root.
+/cov_*.bin
+# Internal notes: research and the workspace's own source index, like DEVLOG.md.
+/LINK_NETPLAY_STUDY.md
+/DOC_SOURCES_INDEX.md
