@@ -23,6 +23,12 @@ constexpr uint32_t kRunawayInstructions = 2000000;
 constexpr uint32_t kWorkImageSize = 0x00C000;
 constexpr uint32_t kBatteryRamSize = 0x003000;
 constexpr uint32_t kFlashTailSize = 0x010000;
+// 🏆 RETRO_MEMORY_SYSTEM_RAM = the 16 KiB at 0x4000..0x7FFF: 12 KiB work RAM + 4 KiB
+// shared Z80 RAM. That is the layout Beetle NGP exposes and rcheevos maps for console
+// "ngp", so the achievement sets written against it read the same bytes here. Shifting
+// the base by one byte would not fail loudly -- every achievement would just never fire.
+constexpr uint32_t kSystemRamBase = 0x004000;
+constexpr uint32_t kSystemRamSize = 0x004000;
 constexpr uint32_t kCart0Base = 0x200000;
 constexpr uint32_t kCart1Base = 0x800000;
 constexpr size_t kMaximumRomSize = 0x400000;
@@ -116,6 +122,23 @@ ngpcraft::CableLink cable;
 std::string link_peer_address;
 uint16_t link_port = ngpcraft::kDefaultPort;
 bool link_announced = false;
+
+// The core has no pointer into its memory -- only ngpc_read_mem/ngpc_write_mem -- and
+// retro_get_memory_data must hand out one the frontend reads whenever it likes. So the
+// frontend gets a MIRROR, refreshed after every frame. `system_ram_seen` is what the
+// mirror held when we last filled it: a byte that differs from it before the next frame
+// was written by the FRONTEND (RetroArch's cheat search, a memory poke), and goes back
+// into the machine. Without that, such a write would be silently overwritten.
+std::array<uint8_t, kSystemRamSize> system_ram{};
+std::array<uint8_t, kSystemRamSize> system_ram_seen{};
+
+// retro_cheat_set codes, held once per frame like the desktop's CheatSet (core/cheats.py)
+// and in the same text format, so a code shared from one runs on the other.
+struct CheatWrite {
+    uint32_t addr;
+    std::vector<uint8_t> bytes;
+};
+std::vector<std::vector<CheatWrite>> cheats;
 
 void fallback_log(enum retro_log_level level, const char* fmt, ...) {
     (void)level;
@@ -592,6 +615,91 @@ size_t state_size() {
            sizeof(ngpc_link_state_t) + sizeof(ngpc_rtc_t) + kWorkImageSize;
 }
 
+void pull_system_ram() {
+    if (!machine) return;
+    ngpc_read_mem(machine, kSystemRamBase, system_ram.data(), kSystemRamSize);
+    system_ram_seen = system_ram;
+}
+
+void push_system_ram() {
+    if (!machine) return;
+    for (uint32_t i = 0; i < kSystemRamSize; ++i) {
+        if (system_ram[i] != system_ram_seen[i])
+            ngpc_write_mem(machine, kSystemRamBase + i, &system_ram[i], 1);
+    }
+}
+
+// Where a held write may land: work RAM, shared Z80 RAM, video RAM -- core/cheats.py's
+// WRITABLE. The desktop only WARNS outside it, because its player sees the warning; here
+// nobody would. And a write into the cartridge is not a no-op, it is a command to the
+// save flash, so it is refused, not held.
+bool cheat_writable(uint32_t addr, size_t size) {
+    return addr >= 0x004000 && addr + size - 1 <= 0x00BFFF;
+}
+
+// One code is `ADDR[:SIZE] = VALUE`, hex, size 1/2/4 (default 1), value little-endian --
+// the desktop's line format. Several codes in one cheat are joined by '+', ';' or a
+// newline, which is how RetroArch passes a multi-part code.
+bool parse_cheat(const char* code, std::vector<CheatWrite>& out) {
+    std::string text = code ? code : "";
+    for (char& c : text)
+        if (c == '+' || c == ';' || c == '\r') c = '\n';
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        std::string part;
+        for (size_t i = start; i < end; ++i)
+            if (text[i] != ' ' && text[i] != '\t') part += text[i];
+        start = end + 1;
+        if (part.empty()) continue;
+
+        const size_t eq = part.find('=');
+        if (eq == std::string::npos) return false;
+        std::string left = part.substr(0, eq);
+        std::string right = part.substr(eq + 1);
+        unsigned size = 1;
+        const size_t colon = left.find(':');
+        if (colon != std::string::npos) {
+            const std::string s = left.substr(colon + 1);
+            if (s != "1" && s != "2" && s != "4") return false;
+            size = static_cast<unsigned>(s[0] - '0');
+            left.resize(colon);
+        }
+        auto strip_0x = [](std::string& s) {
+            if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s.erase(0, 2);
+        };
+        strip_0x(left);
+        strip_0x(right);
+        auto hex = [](const std::string& s, size_t max_digits, uint32_t& v) {
+            if (s.empty() || s.size() > max_digits) return false;
+            v = 0;
+            for (char c : s) {
+                int d = (c >= '0' && c <= '9') ? c - '0'
+                      : (c >= 'a' && c <= 'f') ? c - 'a' + 10
+                      : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+                if (d < 0) return false;
+                v = (v << 4) | static_cast<uint32_t>(d);
+            }
+            return true;
+        };
+        uint32_t addr = 0, value = 0;
+        if (!hex(left, 6, addr) || !hex(right, size * 2, value)) return false;
+        if (!cheat_writable(addr, size)) return false;
+        CheatWrite w{addr, {}};
+        for (unsigned i = 0; i < size; ++i) w.bytes.push_back(static_cast<uint8_t>(value >> (8 * i)));
+        out.push_back(w);
+    }
+    return !out.empty();
+}
+
+void apply_cheats() {
+    if (!machine) return;
+    for (const auto& cheat : cheats)
+        for (const CheatWrite& w : cheat)
+            ngpc_write_mem(machine, w.addr, w.bytes.data(), static_cast<uint32_t>(w.bytes.size()));
+}
+
 } // namespace
 
 extern "C" {
@@ -674,7 +782,10 @@ RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device) 
     if (port == 0) controller_device = device;
 }
 
-RETRO_API void retro_reset(void) { reset_with_persistent_state(); }
+RETRO_API void retro_reset(void) {
+    reset_with_persistent_state();
+    pull_system_ram();
+}
 
 RETRO_API bool retro_load_game(const struct retro_game_info* game) {
     if (!game || !game->data || game->size < 0x30 || game->size > kMaximumRomSize)
@@ -709,6 +820,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
                                                                  : "ON (silicon)");
 
     reset_machine();
+    pull_system_ram();
     initialize_save_ram();
     save_loaded = false; // RetroArch may replace the SRAM buffer after this call.
     power_pressed = false;
@@ -733,6 +845,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
         {0, 0, 0, 0, nullptr}
     };
     environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void*)inputs);
+    bool achievements = true;
+    environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, &achievements);
     /* ⛔ THE CABLE IS ARMED HERE, NOT ONLY ON AN OPTION CHANGE. It used to be applied
      * solely from the GET_VARIABLE_UPDATE branch in retro_run, so a player who set
      * "Link cable = host" and THEN launched a game got no cable at all: the option was
@@ -761,16 +875,25 @@ RETRO_API void retro_unload_game(void) {
     console_mono = false;
     cable.shutdown();
     link_announced = false;
+    cheats.clear();
+    system_ram.fill(0);
+    system_ram_seen.fill(0);
 }
 
 RETRO_API unsigned retro_get_region(void) { return RETRO_REGION_NTSC; }
 
 RETRO_API void* retro_get_memory_data(unsigned id) {
-    return id == RETRO_MEMORY_SAVE_RAM && machine ? &save_ram : nullptr;
+    if (!machine) return nullptr;
+    if (id == RETRO_MEMORY_SAVE_RAM) return &save_ram;
+    if (id == RETRO_MEMORY_SYSTEM_RAM) return system_ram.data();
+    return nullptr;
 }
 
 RETRO_API size_t retro_get_memory_size(unsigned id) {
-    return id == RETRO_MEMORY_SAVE_RAM && machine ? sizeof(save_ram) : 0;
+    if (!machine) return 0;
+    if (id == RETRO_MEMORY_SAVE_RAM) return sizeof(save_ram);
+    if (id == RETRO_MEMORY_SYSTEM_RAM) return system_ram.size();
+    return 0;
 }
 
 RETRO_API size_t retro_serialize_size(void) { return machine ? state_size() : 0; }
@@ -820,11 +943,28 @@ RETRO_API bool retro_unserialize(const void* data, size_t size) {
     // how fast a byte shifts.
     if (ngpc_set_link_state(machine, &link) != 0) return false;
     ngpc_set_rtc(machine, &rtc);
+    pull_system_ram();
     return true;
 }
 
-RETRO_API void retro_cheat_reset(void) {}
-RETRO_API void retro_cheat_set(unsigned, bool, const char*) {}
+RETRO_API void retro_cheat_reset(void) { cheats.clear(); }
+
+RETRO_API void retro_cheat_set(unsigned index, bool enabled, const char* code) {
+    if (cheats.size() <= index) cheats.resize(index + 1);
+    cheats[index].clear();
+    if (!enabled) return;
+    std::vector<CheatWrite> parsed;
+    if (parse_cheat(code, parsed)) {
+        cheats[index] = std::move(parsed);
+    } else {
+        /* All or nothing: a code that loads three of its four writes is a cheat that
+         * half-works, and that is the state that wastes the most time. */
+        log_message(RETRO_LOG_WARN,
+                    "NgpCraft: cheat %u ignored -- expected `ADDR[:1|2|4] = VALUE` (hex), "
+                    "codes joined by '+', in RAM 0x4000-0xBFFF: \"%s\"\n",
+                    index, code ? code : "");
+    }
+}
 
 RETRO_API void retro_run(void) {
     if (!machine) return;
@@ -859,6 +999,8 @@ RETRO_API void retro_run(void) {
     if (input_poll_cb) input_poll_cb();
     const uint8_t pad = read_pad();
     ngpc_write_mem(machine, 0x00B0, &pad, 1);
+    push_system_ram();
+    apply_cheats();
 
     ngpc_summary_t summary{};
     run_one_frame(summary);
@@ -876,6 +1018,7 @@ RETRO_API void retro_run(void) {
         last_stop_status = summary.stop_status;
         last_stop_pc = summary.stop_pc;
     }
+    pull_system_ram();
 
     const uint32_t pixel_count = static_cast<uint32_t>(native_video.size());
     if (ngpc_get_framebuffer(machine, native_video.data(), pixel_count) == pixel_count) {

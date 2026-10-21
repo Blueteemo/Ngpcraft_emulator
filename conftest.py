@@ -70,6 +70,9 @@ def pytest_configure(config):  # noqa: ANN001, ARG001
     # the suite would punch holes in the developer's own box -- and pay the discovery
     # timeout on every hosting test of a CI machine that has no box at all.
     os.environ["NGPCRAFT_NO_UPNP"] = "1"
+    # ...and off the player's netplay.log: dozens of tests connect and fail on purpose.
+    os.environ["NGPCRAFT_NETLOG"] = str(
+        Path(tempfile.mkdtemp(prefix="ngpcraft-tests-")) / "netplay.log")
 
 
 def cfg_env() -> str:

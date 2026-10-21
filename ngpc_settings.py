@@ -474,6 +474,23 @@ def screenshot_dir(s: QSettings) -> str:
     return str(s.value("paths/screenshots", "", type=str))
 
 
+def run_ahead(s: QSettings) -> int:
+    # Default 0 = OFF, and 0 is exactly the emulator without the feature: nothing runs
+    # ahead, nothing is built. 1 or 2 frames shown from the future (ngpc_runahead).
+    try:
+        v = int(s.value("general/run_ahead", 0))
+    except (ValueError, TypeError):
+        v = 0
+    return v if v in (0, 1, 2) else 0
+
+
+def soft_patching(s: QSettings) -> bool:
+    # Default ON: a `Game.ips` / `Game.bps` beside `Game.ngc` is applied as the game
+    # loads, in memory -- the scene convention (RetroArch, mGBA, Mesen). Dropping the
+    # file there is the request; nobody puts a patch beside a ROM by accident.
+    return bool(s.value("general/soft_patching", True, type=bool))
+
+
 def cart_wait_states(s: QSettings) -> bool:
     # Default ON: model the slow cartridge flash. Every instruction is fetched
     # from the cart and data tables are read from it, and that bus is slow. With

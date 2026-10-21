@@ -12,6 +12,8 @@ venv/
 /watches/
 /screenshots/
 /crashes/
+# netplay.log: addresses of the people you played with -- never shipped
+/logs/
 /saves/
 system_ram.bin
 *.state

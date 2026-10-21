@@ -289,6 +289,17 @@ class InProcessLink:
         self.b.serial_set_enabled(False)
 
 
+# The first record a MIRROR-mode emulator sends (core/netplay.py: _HDR "<BI" with
+# _T_HELLO = 1 and frame 0, then a 2-byte length and the JSON hello). Spelled out here
+# rather than imported: netplay imports this module.
+_MIRROR_HELLO_HEAD = b"\x01\x00\x00\x00\x00"
+
+
+def _is_mirror_hello(data: bytes) -> bool:
+    head = len(_MIRROR_HELLO_HEAD)
+    return data.startswith(_MIRROR_HELLO_HEAD) and data[head + 2:head + 4] == b'{"'
+
+
 class TcpLink:
     """Cable between one local machine and a remote peer over TCP.
 
@@ -331,6 +342,8 @@ class TcpLink:
         # So the link records the loss instead of raising it, and stops touching a dead
         # socket. The owner polls this and can say so; the emulation is never disturbed.
         self.lost: str | None = None
+        self._sniffed = False       # the first bytes were checked (see _mirror_hello)
+        self._sniff_pumps = 0
 
     # --- connection helpers -------------------------------------------------
     @classmethod
@@ -354,6 +367,9 @@ class TcpLink:
         """The peer is gone. Record it once and let go of the socket."""
         if self.lost is None:
             self.lost = why or "peer closed"
+            from core import netlog
+            netlog.log("cable_lost", why=self.lost, bytes_in=self.bytes_in,
+                       bytes_out=self.bytes_out)
         # The console must SEE the cut. Dropping the detect line is what a yanked cable
         # does on silicon, and it is how a game raises its own link error instead of
         # waiting for ever on a peer that has gone. (The shell also detaches the link,
@@ -417,6 +433,22 @@ class TcpLink:
             pass
         except OSError as e:
             self._lose(str(e))
+
+        # 2b) THE OTHER PLAYER CHOSE MIRROR. Its first words are a mirror hello, not a
+        # game's serial bytes; fed to the console they are noise, and the mirror side
+        # then hangs up on us -- which is all this side could ever report. Recognise
+        # the hello and say which mode the other player is in.
+        if not self._sniffed and self._rx:
+            self._sniff_pumps += 1
+            if (len(self._rx) < len(_MIRROR_HELLO_HEAD) + 4
+                    and self._rx[0] == _MIRROR_HELLO_HEAD[0] and self._sniff_pumps < 30):
+                return                  # too short to tell yet: decide next pump (bounded:
+                                        # a game whose first byte IS 0x01 still gets it)
+            self._sniffed = True
+            if _is_mirror_hello(bytes(self._rx)):
+                self._rx.clear()
+                self._lose("peer_mirror_mode")
+                return
 
         # 3) buffer -> local RX FIFO. Push unconditionally: the core's serial_tick
         # is the flow-control gate (it only PRESENTS a byte to the CPU once our RTS

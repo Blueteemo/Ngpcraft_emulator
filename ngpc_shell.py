@@ -1692,6 +1692,14 @@ class SettingsPage(QWidget):
             str(cfg.rewind_seconds(self._settings)))
         self._lbl_rewind = QLabel()
 
+        self._runahead_box = self._combo("general/run_ahead", [
+            ("0", "runahead_off"), ("1", "runahead_1"), ("2", "runahead_2")],
+            str(cfg.run_ahead(self._settings)))
+        self._lbl_runahead = QLabel()
+        self._runahead_hint = QLabel()
+        self._runahead_hint.setObjectName("hint")
+        self._runahead_hint.setWordWrap(True)
+
         self._cartwait = QCheckBox()
         self._cartwait.setChecked(cfg.cart_wait_states(self._settings))
         self._cartwait.toggled.connect(
@@ -1719,11 +1727,13 @@ class SettingsPage(QWidget):
             _row(self._lbl_savemode, self._savemode),
             _row(self._lbl_flashsize, self._flashsize),
             _row(self._lbl_rewind, self._rewind),
+            _row(self._lbl_runahead, self._runahead_box),
             _row(self._lbl_cartwait, self._cartwait),
             _row(self._lbl_portable, self._portable),
         ]
         for r in self._rows_general:
             v.addWidget(r)
+        v.addWidget(self._runahead_hint)
         v.addWidget(self._cartwait_hint)
         v.addWidget(self._portable_hint)
         return w
@@ -1797,6 +1807,15 @@ class SettingsPage(QWidget):
         self._realbios_hint.setObjectName("hint")
         self._realbios_hint.setWordWrap(True)
 
+        self._softpatch = QCheckBox()
+        self._softpatch.setChecked(cfg.soft_patching(self._settings))
+        self._softpatch.toggled.connect(
+            lambda b: (self._settings.setValue("general/soft_patching", b), self.changed.emit()))
+        self._lbl_softpatch = QLabel()
+        self._softpatch_hint = QLabel()
+        self._softpatch_hint.setObjectName("hint")
+        self._softpatch_hint.setWordWrap(True)
+
         self._clock_items = [
             (ns.CLOCK_HARDWARE, "clk_hardware"), (ns.CLOCK_HOST, "clk_host"),
             (ns.CLOCK_PAUSED, "clk_paused"), (ns.CLOCK_MANUAL, "clk_manual")]
@@ -1846,6 +1865,8 @@ class SettingsPage(QWidget):
         v.addWidget(self._bios_hint2)
         v.addWidget(_row(self._lbl_realbios, self._realbios))
         v.addWidget(self._realbios_hint)
+        v.addWidget(_row(self._lbl_softpatch, self._softpatch))
+        v.addWidget(self._softpatch_hint)
         v.addWidget(_row(self._lbl_clockmode, self._clockmode))
         self._clockset_row = _row(self._lbl_clockset, self._clockset)
         v.addWidget(self._clockset_row)
@@ -2381,7 +2402,13 @@ class SettingsPage(QWidget):
         self._lbl_rewind.setText(t("rewind"))
         for i, key in enumerate(["rewind_off", "rewind_10", "rewind_20", "rewind_30"]):
             self._rewind.setItemText(i, t(key))
+        self._lbl_runahead.setText(t("runahead"))
+        for i, key in enumerate(["runahead_off", "runahead_1", "runahead_2"]):
+            self._runahead_box.setItemText(i, t(key))
+        self._runahead_hint.setText(t("runahead_hint"))
         self._realbios_hint.setText(t("console_boot_hint"))
+        self._lbl_softpatch.setText(t("soft_patching"))
+        self._softpatch_hint.setText(t("soft_patching_hint"))
         self._lbl_clockmode.setText(t("clock_mode"))
         self._lbl_clockset.setText(t("clock_manual"))
         if cfg.clock_mode(self._settings) == ns.CLOCK_MANUAL:
@@ -2824,6 +2851,9 @@ class PlayPage(QWidget):
         self._menu_ticks = 0               # frames the BIOS has idled in its shell loop
         self._slot = 0                     # active save-state slot (0..STATE_SLOTS-1)
         self._speed = 1.0                  # emulation speed multiplier
+        self._runahead = None              # the ghost console, see ngpc_runahead
+        self._runahead_frames = 0
+        self._runahead_off_for = None      # the ROM it gave up on (self-check failed)
         self._ff = False                   # fast-forward while a key is held
         self._scale = cfg.lcd_scale(settings)
         self._smooth = cfg.smoothing(settings)
@@ -3038,6 +3068,7 @@ class PlayPage(QWidget):
         # has run nothing. (stop() detaches a mirror, but a local cable peer is detached
         # by the shell, so this cannot be left to it.)
         self._prerun.clear()
+        self._drop_runahead()                   # its ghost holds the previous cartridge
         self._rom_path = Path(rom)
         self.watches.load(self._watch_path())   # this ROM's named watches, if any
         self.cheats.load(self._cheat_path())    # ...and its cheats
@@ -3052,10 +3083,13 @@ class PlayPage(QWidget):
         # Unpack a .zip/.7z here (once) so the flash chip is sized on the ROM's real,
         # uncompressed length -- the archive's file size would be wrong -- and the bytes
         # are handed straight to the session instead of being read twice.
-        loaded = rom_loader.load(self._rom_path)
+        loaded = rom_loader.load(self._rom_path, softpatch=cfg.soft_patching(self._settings))
         cap = cfg.flash_capacity_bytes(self._settings, len(loaded.data))
         self.session = NativeSession(
-            rom, rom_bytes=loaded.data, from_archive=loaded.from_archive,
+            rom, rom_bytes=loaded.data,
+            # A PATCHED image is read-only like an archive: writing the save back "into
+            # the ROM" would write the patch into the clean dump. See core.softpatch.
+            from_archive=loaded.read_only,
             bios_path=self._bios_path(), real_bios=self._real_bios,
             save_to_rom=mode in (cfg.SAVE_ROM, cfg.SAVE_BOTH),
             sidecar=mode in (cfg.SAVE_SIDECAR, cfg.SAVE_BOTH),
@@ -3090,6 +3124,13 @@ class PlayPage(QWidget):
         self._did_handoff = False; self._menu_ticks = 0; self._bios_frames = 0
         self._lib.note_launch(self._rom_path)   # one more play, and the most recent
         self._begin_run()
+        # Said every time, not once: an IPS has no checksum, so "which patch is on" is
+        # the only thing that tells a broken game from a patch made for another dump.
+        lang = cfg.language(self._settings)
+        if loaded.patch is not None:
+            self._flash(cfg.tr(lang, "patch_applied").format(name=loaded.patch.name), 3000)
+        elif loaded.patch_error:
+            self._flash(cfg.tr(lang, "patch_refused").format(why=loaded.patch_error), 6000)
 
     def start_bios(self) -> None:
         """Boot the BIOS with NO cartridge -- the console's own screen (language,
@@ -3105,6 +3146,15 @@ class PlayPage(QWidget):
         # would be credited as playtime to whatever was played before it.
         self._rom_path = None
         self._raw = native.NativeMachine(_NO_CART, bios=bios.read_bytes())
+        # ⏱️ ...AND HOW FAST IT RUNS -- the other thing it forgot. A game is tuned in
+        # start(); this machine never was, so the BIOS ran on FREE memory: twice the
+        # instructions per frame (measured 17 470 against 8 454 with the silicon model)
+        # spinning in its wait loops, and nearly twice the host time of a game frame
+        # (1.87 ms against 1.05 for Sonic, on the dev PC). A PC that keeps up with the
+        # games could fall behind on the BIOS screen alone -- reported 2026-10-21:
+        # "the BIOS animations and the horoscope run slow, the games are fine".
+        if cfg.cart_wait_states(self._settings):
+            self._raw.set_timing_silicon(cfg.CART_FETCH_WAIT, cfg.CART_BIOS_WAIT)
         # ⚡ WHICH CONSOLE THIS IS -- the one thing this path forgot to say.
         #
         # Booting a cartridge goes through NativeSession, which is handed
@@ -3155,6 +3205,8 @@ class PlayPage(QWidget):
 
     def stop(self) -> None:
         self._gif_finish(wait=True)
+        self._rec_finish(wait=True)
+        self._drop_runahead()
         self.timer.stop()
         self._autohide_timer.stop(); self._idle_hidden = False   # no game -> no idle hide
         # ⚡ The mirror owns a SECOND console and a socket. Left attached, they outlive
@@ -3212,6 +3264,9 @@ class PlayPage(QWidget):
         self._color = cfg.color_profile(self._settings)
         self._aspect = cfg.aspect_mode(self._settings)
         self._fullscreen = cfg.fullscreen(self._settings)
+        if cfg.run_ahead(self._settings) != self._runahead_frames:
+            self._runahead_frames = cfg.run_ahead(self._settings)
+            self._drop_runahead()
         # The LCD ALWAYS fills the page and follows the window; _blit() scales the
         # frame into whatever size it currently has (with the chosen aspect). The
         # 'scale' setting is now just the preset window size applied on launch, not a
@@ -3732,6 +3787,8 @@ class PlayPage(QWidget):
         btn("📷", "tb_screenshot", self.screenshot, action=cfg.HK_SHOT)
         import ngpc_gif
         ngpc_gif.install_button(self, h, REPO)
+        import ngpc_record
+        ngpc_record.install_button(self, h, REPO)
         h.addSpacing(10)
         rw = QPushButton("⏪"); rw.setObjectName("barBtn")
         rw.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -4053,7 +4110,8 @@ class PlayPage(QWidget):
         backlog into the pacer and freeze the loop (frames_to_run stays 0)."""
         if self.machine is not None:
             try:
-                self.machine.audio()
+                # A recording keeps it: a stepped frame is a frame of the video too.
+                self._rec_audio(self.machine.audio())
             except Exception:
                 pass
 
@@ -4108,6 +4166,7 @@ class PlayPage(QWidget):
             self._leave_rewind()                        # branch from here if we had scrubbed
             self.machine.run_frames(1)
             self._gif_feed()
+            self._rec_feed()
             self._rewind.append(self._capture_state())
             self._flash("⏩ +1 f")
         self._drain_audio_silently()
@@ -4817,12 +4876,15 @@ class PlayPage(QWidget):
         # later. Flashed, and for long enough to read and repeat back.
         lost = getattr(self._mirror.pipe, "lost", None)
         if lost:
-            self._flash(t("link_lost").format(why=lost), self.MIRROR_ERROR_MS)
+            self._flash(_net_why_text(cfg.language(self._settings), lost,
+                                      getattr(self._mirror, "hs", None)),
+                        self.MIRROR_ERROR_MS)
             self.mirror_ended.emit(str(lost))
             return None
         result = self._mirror.step(self._joypad_byte())
         if result == "rejected":
-            self._flash(t("mirror_refused").format(why=self._mirror.rejected),
+            self._flash(_net_why_text(cfg.language(self._settings), self._mirror.rejected,
+                                      getattr(self._mirror, "hs", None)),
                         self.MIRROR_ERROR_MS)
             self.mirror_ended.emit(str(self._mirror.rejected))
             return None
@@ -5317,6 +5379,7 @@ class PlayPage(QWidget):
             # and which won would depend on where in the frame each ran.
             self.cheats.apply(self.machine)
             self._gif_feed()
+            self._rec_feed()
             for hook in self.frame_hooks:        # per-frame debug sampling, if subscribed
                 try:
                     hook()
@@ -5335,8 +5398,11 @@ class PlayPage(QWidget):
             if self.audio is not None:
                 a = self.machine.audio()          # always drain the core's audio buffer
                 self._last_audio = a              # feed the debug oscilloscope
+                self._rec_audio(a)                # recorded at console speed, FF or not
                 if self._speed == 1.0 and not self._ff:
                     self.pending += a             # ...but only queue it at real speed (mute FF/slow)
+            elif self._rec is not None:           # no sound device: a recording still wants it
+                self._rec_audio(self.machine.audio())
         self._drain_pending()
         if self._real_bios and not self._did_handoff:
             self._bios_handoff_assist()      # BIOS booted -> jump into the cartridge
@@ -5344,8 +5410,44 @@ class PlayPage(QWidget):
             self._vgm.feed(self.machine.apu_write_count(), self.machine.apu_writes())
         self._perf_wall += time.perf_counter() - emu_t0
         self._perf_frames += ran
-        self._blit()
+        self._blit(self._runahead_frame(ran))
         self._update_osd(ran)
+
+    # ---- run-ahead (optional, off by default) ------------------------------
+    def _drop_runahead(self) -> None:
+        if self._runahead is not None:
+            try:
+                self._runahead.close()
+            except Exception:
+                pass
+            self._runahead = None
+
+    def _runahead_frame(self, ran: int):
+        """The future frame to show instead of the real one, or None. Off whenever the
+        future cannot be one console's alone (cable, netplay) or is not real time."""
+        if (self._runahead_frames == 0 or ran == 0 or self.session is None
+                or self._mirror is not None or self._link_peer is not None
+                or self._net_link is not None or self._ff or self._speed != 1.0
+                or self._rom_path == self._runahead_off_for
+                or (self._real_bios and not self._did_handoff)):
+            self._drop_runahead()
+            return None
+        try:
+            if self._runahead is None:
+                import ngpc_runahead
+                self._runahead = ngpc_runahead.RunAhead(self, self._runahead_frames)
+            fb = self._runahead.frame(ran)
+            if self._runahead.gave_up:
+                self._runahead_off_for = self._rom_path
+                self._drop_runahead()
+                self._flash(cfg.tr(cfg.language(self._settings), "runahead_gave_up"), 5000)
+                return None
+            return fb
+        except Exception as exc:                 # a display aid must never stop the game
+            self._runahead_off_for = self._rom_path
+            self._drop_runahead()
+            self._flash(f"run-ahead: {exc}", 5000)
+            return None
 
     def perf(self) -> dict:
         """What the emulated CONSOLE is doing -- for the debug tools.
@@ -5414,7 +5516,7 @@ class PlayPage(QWidget):
             self._blit()
         QTimer.singleShot(0, _go)
 
-    def _blit(self) -> None:
+    def _blit(self, fb: list[int] | None = None) -> None:
         if self.machine is None:
             return
         bw, bh = max(SCREEN_W, self.lcd.width()), max(SCREEN_H, self.lcd.height())
@@ -5423,8 +5525,8 @@ class PlayPage(QWidget):
         k = max(1, min(bw // SCREEN_W, bh // SCREEN_H))
         k = min(k, 8)                                    # cap the numpy cost
         pix = ngpc_video.render_pixmap(
-            self.machine.framebuffer(), k, self._filter, self._color, self._smooth,
-            self._scaler)
+            fb if fb is not None else self.machine.framebuffer(), k, self._filter,
+            self._color, self._smooth, self._scaler)
         pix = ngpc_video.fit_pixmap(pix, bw, bh, self._aspect, self._smooth)
         self.lcd.setPixmap(pix)
 
@@ -5447,6 +5549,23 @@ def _local_ip() -> str:
 
 class _Cancelled(Exception):
     """The player took the attempt back. Not a failure -- nothing to report."""
+
+
+def _net_why_text(lang: str, why: str, hs=None) -> str:
+    """An online failure as a sentence that says what to change, plus where the log is.
+
+    Replaces `"lien perdu : peer_closed ([WinError 10054] ...)"`: true, and useless --
+    the number says neither which side gave up nor why. core.netplay.explain turns the
+    code into the likeliest cause; netplay.log keeps the raw text for whoever reads it.
+    """
+    from core import netlog
+    from core.netplay import explain
+    key, fields = explain(why, hs)
+    try:
+        text = cfg.tr(lang, key).format(**fields)
+    except (KeyError, IndexError):
+        text = cfg.tr(lang, key)
+    return text + "  " + cfg.tr(lang, "net_log_hint").format(path=netlog.path())
 
 
 def _net_error_text(lang: str, exc: Exception, mode: str) -> str:
@@ -6199,6 +6318,34 @@ class Shell(QMainWindow):
             self.play.resume_play()
         self._update_rail(idx)
 
+    def open_from_another_launch(self, rom_str: str) -> None:
+        """A second launch (a ROM double-clicked in the file manager) handed us its file:
+        come to the front and play it -- see ngpc_single_instance. Leaving the current
+        game is what picking another one in the library does: stop() commits its save.
+        A link match is the exception, because closing it also ends the other player's:
+        that one is asked first."""
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if not rom_str:
+            return
+        play = self.play
+        linked = (play._link_peer is not None or play._net_link is not None
+                  or play._mirror is not None or self._link2p is not None)
+        if linked:
+            lang = cfg.language(self._settings)
+            if QMessageBox.question(
+                    self, cfg.tr(lang, "open_during_link_title"),
+                    cfg.tr(lang, "open_during_link").format(name=Path(rom_str).name),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+            if self._link2p is not None:
+                self._link2p.close()
+        self._launch(rom_str)
+
     def _launch(self, rom_str: str) -> None:
         self.library._stop_worker()          # no thumbnail core alongside the game's core
         self._stack.setCurrentWidget(self.play)
@@ -6259,6 +6406,9 @@ class Shell(QMainWindow):
             return
         p2 = PlayPage(self._settings, self._library_db)
         p2._link_btn.hide()                        # noqa: SLF001 -- P2 never re-links
+        # ...nor records: it is the silent guest, and its window is only as wide as its
+        # toolbar -- one more button opened it wider than player 1's.
+        p2._rec_btn.hide()                         # noqa: SLF001
         p2.set_player(2)                           # P2 bindings + gamepad
         p2._lean = True                            # silent + wall-clock paced (see _lean)
         p2.start(Path(rom2))                       # its own flash save loads here
@@ -6388,6 +6538,8 @@ class Shell(QMainWindow):
         opens a mirror session instead. So the flag is armed only on a real start.
         """
         lang = cfg.language(self._settings)
+        from core import netlog
+        netlog.log("connect_start", role=mode, host=host or "-", port=port)
         if self._net_thread is not None:            # one attempt at a time
             # ⛔ NEVER A SILENT `return`. This guard is what turned a host attempt
             # nobody could reach into a dead emulator: it stayed armed for the rest
@@ -6624,6 +6776,13 @@ class Shell(QMainWindow):
             return
         self._stop_net_clock()       # relie: plus rien a compter
         self._close_host_info()      # the panel answered its question: they are in
+        from core import netlog
+        try:
+            peer = "%s:%s" % sock.getpeername()[:2]
+        except OSError:
+            peer = "?"
+        netlog.log("connected", mode=("mirror_" + self._mirror_pending)
+                   if self._mirror_pending else "cable", peer=peer)
         worker = self.sender()
         udp_rule = getattr(worker, "upnp_udp", None)
         if worker is not None:
@@ -6836,7 +6995,7 @@ class Shell(QMainWindow):
         lang = cfg.language(self._settings)
         if x.failed:
             self._end_mirror_bringup()
-            self.play._flash(cfg.tr(lang, "mirror_refused").format(why=x.failed),
+            self.play._flash(_net_why_text(lang, x.failed, x.hs),
                              PlayPage.MIRROR_ERROR_MS)
             return
         if not x.done:
@@ -6972,6 +7131,8 @@ class Shell(QMainWindow):
         # ordinary Host/Join would silently start a MIRROR session instead of a cable.
         self._mirror_pending = None
         self._stop_net_clock()
+        from core import netlog
+        netlog.log("connect_failed", why=msg)
         self.play.overlay.setText(
             cfg.tr(cfg.language(self._settings), "link_failed").format(why=msg))
 
@@ -7026,7 +7187,8 @@ class Shell(QMainWindow):
         crash came from.
         """
         self._end_net_link()
-        self.play._flash(cfg.tr(cfg.language(self._settings), "link_lost").format(why=why))
+        self.play._flash(_net_why_text(cfg.language(self._settings), why),
+                         PlayPage.MIRROR_ERROR_MS)
 
     def _end_net_link(self) -> None:
         if self._net_status is not None:
@@ -7382,6 +7544,12 @@ def stamp_taskbar_icon(win) -> bool:
 
 
 def main() -> int:
+    # --robot: the link-test robot (ngpc_robot.py) -- offscreen, throwaway settings.
+    # Decided BEFORE the QApplication exists, which is when Qt picks its platform.
+    robot = "--robot" in sys.argv
+    if robot:
+        import ngpc_robot
+        ngpc_robot.prepare(sys.argv[1:])
     app = QApplication(sys.argv[:1])
     if APP_ICON.is_file():
         app.setWindowIcon(QIcon(str(APP_ICON)))
@@ -7418,8 +7586,23 @@ def main() -> int:
     else:
         print("[timing] modele silicium (defaut). --timing legacy pour comparer.")
 
+    if robot:
+        return ngpc_robot.run(args, app)
+
+    # ONE EMULATOR PER INSTALL: a ROM double-clicked while we already run goes to the
+    # running window instead of opening a second emulator (ngpc_single_instance).
+    import ngpc_single_instance as single
+    new_instance = single.FLAG in args
+    if new_instance:
+        args.remove(single.FLAG)
     rom = args[0] if args else None
+    name = single.server_name(REPO)
+    if not new_instance and single.forward(name, rom):
+        return 0
     shell = Shell(rom)
+    if not new_instance:
+        shell._instance_server = single.InstanceServer(name, shell)
+        shell._instance_server.requested.connect(shell.open_from_another_launch)
     shell.show()
     # AFTER show(): the property store needs a real HWND, which winId only has once the
     # window exists. This is what puts our picture on the taskbar button (see above).

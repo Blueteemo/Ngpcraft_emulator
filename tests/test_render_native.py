@@ -173,6 +173,29 @@ class RendererAgreementTests(unittest.TestCase):
         self.m.write(0x8012, bytes([0x80 | 0x05]))       # NEG + OOWC 5
         self._assert_same("the negative")
 
+    def test_NEG_on_the_monochrome_console(self) -> None:
+        """The mono NGP's picture comes out of the grey table, not the palettes -- a
+        different path to the same last step. NEG must invert it too, fill included:
+        every pixel of the negative frame is the plain frame XOR 0xFFF.
+        (The scene is poked by hand: the helpers above also check the Python
+        reference, which models the colour console only.)"""
+        self.m.close()
+        self.m = native.NativeMachine(_rom())
+        self.m.set_k1ge_console(True)
+        self.m.reset(bios_handoff=True)
+        self.m.write(0x8100, bytes([(i * 3) & 7 for i in range(24)]))   # the LUTs
+        for t in range(4):
+            self.m.write(CHAR_RAM + t * 16, bytes([0x1B, 0xE4] * 8))
+        for i in range(32 * 32):
+            self.m.write(SCR1_MAP + i * 2, bytes([i & 3, (i & 1) << 5]))
+        self.m.write(0x8002, bytes([20, 15, 90, 60]))    # a sub-window: the fill shows
+        self.m.write(0x8012, bytes([0x05]))
+        plain, _ = self._both()
+        self.m.write(0x8012, bytes([0x80 | 0x05]))
+        negative, _ = self._both()
+        self.assertGreater(len(set(plain)), 2, "the scene must have something to invert")
+        self.assertEqual(negative, [p ^ 0x0FFF for p in plain])
+
     def test_k1ge_compatible_mode(self) -> None:
         """A monochrome cartridge draws through the 3-bit level LUT, not the palettes."""
         self.test_scroll_planes_with_flips_and_palettes()

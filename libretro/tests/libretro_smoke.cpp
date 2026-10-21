@@ -33,6 +33,7 @@ std::string option_cart_timing = "enabled";
 bool machine_options_only = false;
 bool fingerprint_only = false;
 bool link_loopback_only = false;
+bool memory_cheats_only = false;
 /* The crossplay mode: this host becomes ONE of the two consoles on the link cable, and
  * something else -- the NgpCraft desktop emulator, or another copy of this host -- is
  * the other one. See check_link(). */
@@ -467,6 +468,112 @@ bool check_link(const retro_game_info& game) {
 
 } // namespace
 
+/* 🏆 SYSTEM_RAM + CHEATS. Three things, each checked against something the core cannot
+ * fake from the outside:
+ *   1. the mirror IS 0x4000..0x7FFF -- compared with the work image at the tail of a save
+ *      state, which the core fills by its own bus read. A base off by one byte would pass
+ *      a size check and fire no achievement ever.
+ *   2. a held cheat reaches the machine -- read back from the save state, not the mirror,
+ *      so a cheat written only into the mirror fails;
+ *      a FRONTEND poke into the mirror reaches it too (RetroArch's own cheat engine).
+ *   3. what must be refused is refused: the cartridge (a write there commands the save
+ *      flash) and malformed text, with nothing half-applied.
+ * The targets are bytes that stayed constant through 60 untouched frames, so the game is
+ * not writing them back every frame and a mismatch is the core's, not the game's. */
+bool check_memory_cheats(const retro_game_info& game) {
+    constexpr uint32_t kWorkImageSize = 0x00C000;
+    constexpr uint32_t kSysBase = 0x004000;
+    constexpr uint32_t kSysSize = 0x004000;
+    if (!retro_load_game(&game)) {
+        std::fprintf(stderr, "memory-cheats: load failed\n");
+        return false;
+    }
+    auto* ram = static_cast<uint8_t*>(retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM));
+    if (!ram || retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM) != kSysSize) {
+        std::fprintf(stderr, "memory-cheats: SYSTEM_RAM missing or not 16 KiB\n");
+        return false;
+    }
+    std::vector<uint8_t> state(retro_serialize_size());
+    auto machine_byte = [&](uint32_t addr) -> int {
+        if (!retro_serialize(state.data(), state.size())) return -1;
+        return state[state.size() - kWorkImageSize + addr];
+    };
+
+    pad_mask = 0;
+    for (unsigned i = 0; i < 30; ++i) retro_run();
+    if (!retro_serialize(state.data(), state.size()) ||
+        std::memcmp(ram, &state[state.size() - kWorkImageSize + kSysBase], kSysSize) != 0) {
+        std::fprintf(stderr, "memory-cheats: SYSTEM_RAM is not the machine's 0x4000..0x7FFF\n");
+        return false;
+    }
+
+    std::vector<uint8_t> first(ram, ram + kSysSize);
+    std::vector<bool> stable(kSysSize, true);
+    for (unsigned i = 0; i < 60; ++i) {
+        retro_run();
+        for (uint32_t a = 0; a < kSysSize; ++a)
+            if (ram[a] != first[a]) stable[a] = false;
+    }
+    /* Two stable pairs, far from the stack at the top of work RAM. */
+    std::vector<uint32_t> pairs;
+    for (uint32_t a = 0x0100; a + 1 < 0x2000 && pairs.size() < 2; a += 2)
+        if (stable[a] && stable[a + 1]) pairs.push_back(a);
+    if (pairs.size() < 2) {
+        std::fprintf(stderr, "memory-cheats: no stable RAM to aim at in this ROM\n");
+        return false;
+    }
+
+    const uint32_t c_addr = kSysBase + pairs[0];
+    const uint16_t want = static_cast<uint16_t>(((ram[pairs[0] + 1] << 8) | ram[pairs[0]]) ^ 0xA55A);
+    char code[64];
+    std::snprintf(code, sizeof(code), "%06X:2 = %04X", c_addr, want);
+    retro_cheat_set(0, true, code);
+    for (unsigned i = 0; i < 3; ++i) retro_run();
+    if (machine_byte(c_addr) != (want & 0xFF) || machine_byte(c_addr + 1) != (want >> 8) ||
+        ram[pairs[0]] != (want & 0xFF) || ram[pairs[0] + 1] != (want >> 8)) {
+        std::fprintf(stderr, "memory-cheats: held cheat \"%s\" did not reach the machine\n", code);
+        return false;
+    }
+
+    const uint32_t p = pairs[1];
+    const uint8_t poke = static_cast<uint8_t>(ram[p] ^ 0x3C);
+    ram[p] = poke;
+    retro_run();
+    if (machine_byte(kSysBase + p) != poke || ram[p] != poke) {
+        std::fprintf(stderr, "memory-cheats: a frontend poke into SYSTEM_RAM was lost\n");
+        return false;
+    }
+
+    /* Refusals: one good part next to a bad one must not apply the good one. */
+    const int before = machine_byte(kSysBase + p + 1);
+    char mixed[96];
+    std::snprintf(mixed, sizeof(mixed), "%06X = %02X+200000 = 00", kSysBase + p + 1,
+                  static_cast<unsigned>(before ^ 0xFF));
+    log_output.clear();
+    retro_cheat_set(1, true, mixed);
+    retro_cheat_set(2, true, "4100 = ZZ");
+    retro_cheat_set(3, true, "4100:3 = 00");
+    retro_run();
+    const size_t ignored = [&] {
+        size_t n = 0, at = 0;
+        while ((at = log_output.find("ignored", at)) != std::string::npos) { ++n; ++at; }
+        return n;
+    }();
+    if (ignored != 3 || machine_byte(kSysBase + p + 1) != before) {
+        std::fprintf(stderr, "memory-cheats: a bad code was not refused whole (%zu refusals)\n",
+                     ignored);
+        return false;
+    }
+
+    /* Disabled = no longer held: the game is free again (we only check nothing breaks). */
+    retro_cheat_set(0, false, code);
+    retro_cheat_reset();
+    retro_run();
+    retro_unload_game();
+    std::printf("memory_cheats=ok base=%06X cheat=%s poke=%06X\n", kSysBase, code, kSysBase + p);
+    return true;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s test-rom.ngc [--no-bitmask] [--bios-missing] "
@@ -482,6 +589,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--machine-options") == 0) machine_options_only = true;
         else if (std::strcmp(argv[i], "--fingerprint") == 0) fingerprint_only = true;
         else if (std::strcmp(argv[i], "--link-loopback") == 0) link_loopback_only = true;
+        else if (std::strcmp(argv[i], "--memory-cheats") == 0) memory_cheats_only = true;
         else if (std::strncmp(argv[i], "--link=", 7) == 0) option_link = argv[i] + 7;
         else if (std::strncmp(argv[i], "--link-frames=", 14) == 0)
             link_frames = static_cast<unsigned>(std::strtoul(argv[i] + 14, nullptr, 10));
@@ -520,6 +628,11 @@ int main(int argc, char** argv) {
     retro_system_info system{};
     retro_get_system_info(&system);
     retro_game_info game{argv[1], rom.data(), rom.size(), nullptr};
+    if (memory_cheats_only) {
+        const bool ok = check_memory_cheats(game);
+        retro_deinit();
+        return ok ? 0 : 1;
+    }
     if (link_loopback_only) {
         const bool ok = check_link_loopback(game);
         retro_deinit();

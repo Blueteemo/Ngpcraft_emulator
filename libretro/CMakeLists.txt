@@ -114,6 +114,9 @@ if(BUILD_TESTING)
         # declared in the core header and never applied by this front end.
         add_test(NAME libretro_machine_options
             COMMAND ngpcraft_libretro_smoke "${NGPCRAFT_TEST_ROM}" --machine-options)
+        # RETRO_MEMORY_SYSTEM_RAM (RetroAchievements) and retro_cheat_set.
+        add_test(NAME libretro_memory_cheats
+            COMMAND ngpcraft_libretro_smoke "${NGPCRAFT_TEST_ROM}" --memory-cheats)
     endif()
     # The link cable, with the test host playing the peer. Needs the probe ROM, which
     # lives in the desktop emulator's repo (tests/roms/link_probe.ngc) -- the cartridge

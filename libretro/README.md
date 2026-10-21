@@ -8,6 +8,10 @@ Copy `prebuilt/windows-x86_64/ngpcraft_libretro.dll` to RetroArch's cores direct
 
 RetroPad mappings: D-pad for movement, B for NGPC A, A for NGPC B, Start for Option. Native output is 160 x 152 at about 59.95 Hz, with stereo 44.1 kHz audio. Save RAM, save states and rewind are supported. An external BIOS is optional; the clean-room HLE is embedded.
 
+**RetroAchievements** — the core exposes `RETRO_MEMORY_SYSTEM_RAM` as the 16 KiB at `0x4000..0x7FFF` (work RAM + shared Z80 RAM), the layout Beetle NGP uses, so existing NGP achievement sets read the same bytes. RetroArch's memory-based cheat search can also read and write it.
+
+**Cheats** — `retro_cheat_set` takes the desktop emulator's format, `ADDR[:SIZE] = VALUE` in hex (size 1, 2 or 4, default 1, value little-endian), several codes joined by `+`, e.g. `4812:1 = 63+481A:2 = 03E7`. Enabled codes are written once per frame. A code aimed outside RAM (`0x4000..0xBFFF`) or that does not parse is refused whole and logged — a write into the cartridge would be a command to its save flash.
+
 ## Build from the repository root
 
 ```sh
