@@ -177,3 +177,47 @@ def test_a_cancelled_attempt_leaves_no_rule_at_all(monkeypatch):
     except Exception:  # noqa: BLE001 -- _Cancelled, as asked
         pass
     assert closed == [None], "a cancelled host left a rule open on the box"
+
+
+def test_a_retry_after_a_refusal_keeps_its_rule(monkeypatch):
+    """Log of 2026-10-22 22:31: two mirror attempts refused (different BIOS), the third
+    died at 19.2 s mid-trade with 10054. The refused trade left its rule in `_udp_rule`;
+    the next connection released it -- same port on the same box, so the delete removed
+    the rule the new attempt had just opened, and the live NAT session with it."""
+    import types
+    import ngpc_shell
+    closed = []
+
+    class _M:
+        def __init__(self, port):
+            self.port, self.protocols = port, ["TCP", "UDP"]
+
+        def close(self, protocol=None):
+            closed.append((self.port, protocol))
+
+    started = []
+    monkeypatch.setattr(threading.Thread, "start", lambda th: started.append(th) or th.run())
+    S = ngpc_shell.Shell
+    sh = types.SimpleNamespace(_udp_rule=None)
+    adopt = lambda r: S._adopt_rule(sh, r)
+    release = lambda: S._release_udp_rule(sh)
+
+    adopt(_M(7789))                       # attempt 2 connects...
+    adopt(new := _M(7789))                # ...attempt 3 connects without it being freed
+    assert closed == [], "the live attempt's rule was deleted by the previous one's"
+    assert sh._udp_rule is new
+    adopt(None)                           # UPnP failed this time: the old rule let them in
+    assert sh._udp_rule is new and closed == []
+    adopt(_M(7790))                       # a different port: the old one really goes
+    assert closed == [(7789, None)]
+    release()
+    assert closed == [(7789, None), (7790, None)] and sh._udp_rule is None
+
+
+def test_a_refused_trade_gives_its_rule_back():
+    """The refusal itself must release the rule, not leave it to the next attempt."""
+    import inspect
+    import ngpc_shell
+    src = inspect.getsource(ngpc_shell.Shell._pump_mirror_bringup)
+    failed = src[src.index("if x.failed:"):src.index("if not x.done:")]
+    assert "_release_udp_rule()" in failed

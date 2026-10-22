@@ -6800,8 +6800,7 @@ class Shell(QMainWindow):
             # ⚡ The inputs also go by UDP (core/netplay.UdpSide): a lost TCP segment no
             # longer freezes both PCs until it is retransmitted. The box's UDP rule, if
             # UPnP opened one, lives as long as this session (`_release_udp_rule`).
-            self._release_udp_rule()
-            self._udp_rule = udp_rule
+            self._adopt_rule(udp_rule)
             self._begin_mirror(SocketPipe(sock, udp=open_udp(sock, host=(mode == "host"))),
                                host=(mode == "host"))
             return
@@ -6813,8 +6812,7 @@ class Shell(QMainWindow):
             import threading
             threading.Thread(target=udp_rule.close, args=("UDP",), name="upnp-close",
                              daemon=True).start()
-            self._release_udp_rule()
-            self._udp_rule = udp_rule
+            self._adopt_rule(udp_rule)
         if self.play.machine is None:
             try: sock.close()
             except OSError: pass
@@ -6984,6 +6982,7 @@ class Shell(QMainWindow):
         page = self.play
         if page.machine is None or page.session is None or page._rom_path is None:
             _close_pipe(pipe)
+            self._release_udp_rule()
             return
         self._mirror_boot = CartExchange(pipe, page.session._rom,
                                          self._mirror_handshake(host, delay))
@@ -7002,6 +7001,7 @@ class Shell(QMainWindow):
             # The game was closed mid-trade. There is nothing left to build a session
             # for, and pumping on would leave the player sitting in a lobby room.
             self._end_mirror_bringup()
+            self._release_udp_rule()
             return
         for _ in range(8):          # a few chunks per tick: a 4 MiB cart is ~128 of them
             x.pump()
@@ -7010,6 +7010,13 @@ class Shell(QMainWindow):
         lang = cfg.language(self._settings)
         if x.failed:
             self._end_mirror_bringup()
+            # ⛔ A REFUSED TRADE MUST GIVE ITS RULE BACK NOW. Left in `_udp_rule`, it was
+            # closed by the NEXT connection (`_adopt_rule` used to be a plain release):
+            # same port, same box, so that DeletePortMapping removed the rule the new
+            # attempt had just opened -- the 10054 of 2026-10-22 all over again, on every
+            # retry after a refusal (BIOS, version...). Log of 22/10 22:31: refused
+            # twice for the BIOS, the third try died at 19.2 s mid-trade.
+            self._release_udp_rule()
             self.play._flash(_net_why_text(lang, x.failed, x.hs),
                              PlayPage.MIRROR_ERROR_MS)
             return
@@ -7123,6 +7130,26 @@ class Shell(QMainWindow):
 
         self._net_status.timeout.connect(_titre)
         self._net_status.start(500)
+
+    def _adopt_rule(self, rule) -> None:
+        """Make `rule` (or None) the box rule of the link that just connected.
+
+        ⛔ NEVER DELETE AN OLD RULE FOR THE SAME PORT HERE. A rule a previous attempt
+        left behind names the same box entry the new attempt just (re)opened: deleting
+        it cuts the live NAT session, and the trade dies ~20 s later with 10054 on both
+        PCs. Same port: the old object is simply forgotten (and if this attempt could
+        not open the port, the old rule is what let the peer in: it is kept).
+        """
+        old, self._udp_rule = getattr(self, "_udp_rule", None), rule
+        if old is None:
+            return
+        if rule is None:
+            self._udp_rule = old
+            return
+        if getattr(old, "port", None) == getattr(rule, "port", None):
+            return
+        import threading
+        threading.Thread(target=old.close, name="upnp-close", daemon=True).start()
 
     def _release_udp_rule(self) -> None:
         """Close the box's UDP rule a mirror session was using, if UPnP opened one."""
