@@ -10,8 +10,9 @@ read of its window. `commit_save` and `reboot` read the cartridge through the bu
 persisted `00 40 00 40 ...` over all 2 MiB of the .ngc. Header gone: no BIOS anywhere
 will boot that file again. Both now read the CELLS (`flash_peek`).
 
-The window here is the endless one (a 1 asked over a 0, measured on the cartridge to
-never answer), cut mid-poll -- the player's "it sat there" moment.
+The window here is an erase of block 34 cut mid-poll -- the player's "it sat there"
+moment. (It used to be a 1 asked over a 0, believed to never answer; measured
+2026-10-22, that write completes like any other -- hw_test_flash_violation.)
 """
 
 from __future__ import annotations
@@ -73,9 +74,7 @@ class SaveWhileFlashBusy(unittest.TestCase):
         _call(m, VECT_FLASHERS << 8, bc=33 << 8)
         m.write(SRC, b"\x00" * 256)
         _call(m, VECT_FLASHWRITE << 8, bc=1, hl=SRC, de=SAVE_OFFSET)       # a real save
-        m.write(SRC, b"\xFF" * 256)
-        _call(m, VECT_FLASHWRITE << 8, bc=1, hl=SRC, de=SAVE_OFFSET,       # 1 over 0, no erase:
-              budget=20_000)                                                # cut mid-poll
+        _call(m, VECT_FLASHERS << 8, bc=34 << 8, budget=20_000)          # cut mid-erase
         # Precondition: the bus really is answering status, or this test proves nothing.
         self.assertNotEqual(m.read(0x200000, len(HEADER)), HEADER)
         return s

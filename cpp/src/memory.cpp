@@ -1150,21 +1150,17 @@ void Machine::flash_program(int chip, uint32_t base, uint32_t addr, uint8_t data
     const uint8_t after  = uint8_t(before & data);
     if (after != before) { mem[addr] = after; flash_dirty[chip] = true; }
 
-    /* ASKING A 0 BACK UP TO 1 IS NOT A SLOW WRITE, IT IS A WRITE THAT NEVER LANDS.
+    /* ASKING A 0 BACK UP TO 1 IS AN ORDINARY WRITE THAT LANDS AS THE AND -- measured,
+     * see kFlashNever in machine.hpp. A driver that waits for its TARGET then spins on a
+     * byte that will never match: that hang is the driver's, interrupts masked.
      *
-     * ⛔ AND THE CHIP NEVER ADMITS IT. Measured on the cartridge (hw_test_flash_timing,
-     * ROW 9): 262 143 turns of the poll -- 2.45 SECONDS -- and no DQ5. The driver leaves
-     * on its own iteration ceiling or not at all, and every one of those seconds is spent
-     * with interrupts masked on a cartridge that has stopped being memory. That is the
-     * mechanism behind a save that passes in an emulator and takes the console down.
-     *
-     * `flash_fail_cycles` defaults to kFlashNever for exactly that reason. A finite value
-     * gives the DQ5 behaviour the AMD datasheets describe, for a part that has it. */
-    const bool impossible = (data & uint8_t(~before)) != 0;
+     * A finite `flash_fail_cycles` gives the DQ5 behaviour the AMD datasheets describe,
+     * for a part that has it. The cartridge measured does not. */
+    const bool fails = (data & uint8_t(~before)) != 0 && flash_fail_cycles != kFlashNever;
     flash_begin_busy(chip,
-                     impossible ? flash_fail_cycles : flash_program_cycles,
+                     fails ? flash_fail_cycles : flash_program_cycles,
                      uint8_t(~data & 0x80),
-                     impossible ? uint8_t(FlashFailed) : uint8_t(FlashRead));
+                     fails ? uint8_t(FlashFailed) : uint8_t(FlashRead));
 }
 
 void Machine::flash_erase_block(int chip, uint32_t base, uint32_t addr) {
@@ -1346,13 +1342,19 @@ bool Machine::flash_id_read(uint32_t addr, uint8_t& out) const {
 
     /* The device ID names the SIZE, and the BIOS reads it to know how big the cart is.
      * SDK FlashMem.txt gives three parts (4 / 8 / 16 Mbit); the manufacturer byte is
-     * Toshiba's 0x98. Hardcoding one size told every cartridge it was 8 Mbit. */
-    switch (addr - base) {
+     * Toshiba's 0x98. Hardcoding one size told every cartridge it was 8 Mbit.
+     *
+     * The four bytes REPEAT across the whole window, and byte 2 is 0x00 (block not
+     * protected). Measured 2026-10-22 (hw_test_flash_violation): `98 2F 00 80` at
+     * 0x200000, 0x200004, both 8 KB save blocks, the last block and 0x210000. The retail
+     * BIOS reads the ID again at the base of the LAST block (0x3FC000 on 16 Mbit) and
+     * refuses the cartridge if byte 2 is 1 -- answering 0xFF there failed its boot test
+     * (emulator issue #27). */
+    switch ((addr - base) & 3) {
         case 0: out = kFlashManufacturerId; return true;   /* 0x98 = Toshiba */
         case 1: out = flash_device_id(chip); return true;   /* the SIZE, decided once */
-        case 2: out = 0x02;                 return true;
-        case 3: out = kFlashDeviceId3;      return true;   /* the BIOS masks it with 0xF8 and wants 0x80 */
-        default: out = 0xFF; return true;
+        case 2: out = 0x00;                 return true;   /* block protection: none */
+        default: out = kFlashDeviceId3;     return true;   /* the BIOS masks it with 0xF8 and wants 0x80 */
     }
 }
 

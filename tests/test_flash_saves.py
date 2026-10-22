@@ -132,15 +132,11 @@ class FlashTests(unittest.TestCase):
         self._program(BLOCK_8K_A, 0xF0)
         self._program(BLOCK_8K_A, 0x3C)        # 0xF0 & 0x3C = 0x30
 
-        # ⛔ AND THE CHIP SAYS NOTHING. 0x3C asks for four bits the cell has already lost,
-        # so its own verify can never match -- and it does NOT report that. Measured on the
-        # cartridge: 2.45 seconds of polling, no DQ5, the chip still answering status.
-        # The corruption is silent and the driver is the only thing that can end it, which
-        # is why the project's research log could record "FVFY:0002 = NOR AND of old and
-        # new data" from a routine that thought it had succeeded.
-        self.assertEqual(self.m.read(BLOCK_8K_A, 1)[0] & 0x20, 0x00,
-                         "this part does not raise DQ5 -- the corruption is silent")
-        self._reset_chip()                     # the driver's own timeout is the only exit
+        # ⛔ AND THE CHIP SAYS NOTHING. 0x3C asks for four bits the cell has already lost;
+        # the chip completes anyway and does NOT report it (hw_test_flash_violation,
+        # 2026-10-22: no DQ5, the AND read back). The corruption is silent, which is why
+        # the project's research log could record "FVFY:0002 = NOR AND of old and new
+        # data" from a routine that thought it had succeeded.
         self.assertEqual(
             self.m.read(BLOCK_8K_A, 1), b"\x30",
             "programming must AND into the cell -- a NOR bit cannot be raised, only erased",
@@ -189,6 +185,11 @@ class FlashTests(unittest.TestCase):
             self.m.read(CART + 1, 1), b"\x2C",
             "an 8 Mbit part must say 0x2C -- the ID is how the BIOS learns the size",
         )
+        # Measured (hw_test_flash_violation): the 4 bytes repeat across the window and
+        # byte 2 is 0x00. The retail BIOS reads them again at the LAST block's base.
+        ident = bytes([0x98, 0x2C, 0x00, 0x80])
+        for where in (CART, CART + 4, BLOCK_8K_A, BLOCK_16K, CART + 0x10000):
+            self.assertEqual(self.m.read(where, 4), ident, f"ID at 0x{where:06X}")
         self._cmd(CART + 0x5555, 0xF0)         # reset: be memory again
         self.assertEqual(self.m.read(CART, 1), b" "[:1], "the cart image must be back")
 
@@ -226,37 +227,33 @@ class FlashTests(unittest.TestCase):
         self._settle()
         self.assertEqual(self.m.read(BLOCK_8K_A, 1), bytes([0xFF]))
 
-    def test_a_1_asked_over_a_0_NEVER_COMES_BACK(self) -> None:
-        """The failure a slot programmed twice with no erase produces on the console.
+    def test_a_1_asked_over_a_0_COMPLETES_AS_THE_AND_without_DQ5(self) -> None:
+        """What the retail BIOS's boot test counts on (0xFF3013, emulator issue #27).
 
-        ⛔ AND THE CHIP NEVER ADMITS IT. The AMD datasheets say the part runs an internal
-        timer and raises DQ5, and this test was written that way. THE CARTRIDGE SAYS NO:
-        hw_test_flash_timing ROW 9, asked to put 0xFF back over a 0x5A, spun 262 143 turns
-        of the shipped poll loop -- 2.45 SECONDS -- with no DQ5 at all. The stub left on
-        its own iteration ceiling, and the byte was untouched.
+        It writes 0xAA, then 0x55 over it, and waits WITHOUT A CEILING for 0x00. Measured
+        on the cartridge (hw_test_flash_violation, 2026-10-22): status with DQ6 toggling
+        for one ordinary program time, then 0x00, no DQ5. 0xFF over 0x5A: done within two
+        reads, 0x5A. A chip that stays busy for ever here never boots a game through the
+        real BIOS -- which is what this core did.
 
-        That is the mechanism, not a curiosity: two and a half seconds INTERRUPTS MASKED,
-        no V-blank, no watchdog refresh from the game's handler, a micro-DMA still reading
-        a cartridge that stopped being memory. A save that passes in an emulator and takes
-        the console down.
-
-        So the chip stays busy for as long as it is asked, and the only way out is the
-        driver's own timeout followed by a reset. `flash_fail_cycles` gives the datasheet
-        DQ5 behaviour to a part that has it -- this one does not.
+        ⛔ The 2026-09 reading ("2.45 s, no DQ5") was the DRIVER spinning on a target that
+        could never match, not the chip being busy.
         """
         self._erase_block(BLOCK_8K_A)
-        self._program(BLOCK_8K_A, 0x5A)
+        self._program(BLOCK_8K_A, 0xAA)
         self._unlock()
         self._cmd(CART + 0x5555, 0xA0)
-        self._cmd(BLOCK_8K_A, 0xFF)            # asking 0x5A back up to 0xFF
-        for _ in range(4):                     # far longer than any real operation
-            self._settle()
-            status = self.m.read(BLOCK_8K_A, 1)[0]
-            self.assertEqual(status & 0x20, 0x00, "this part does not raise DQ5")
-            self.assertNotEqual(status, 0x5A, "and it never returns to being memory")
-        self._reset_chip()                     # the driver gives up: only this gets out
-        self.assertEqual(self.m.read(BLOCK_8K_A, 1), bytes([0x5A]),
-                         "and the byte is untouched")
+        self._cmd(BLOCK_8K_A, 0x55)            # the BIOS's own impossible write
+        status = self.m.read(BLOCK_8K_A, 1)[0]
+        self.assertEqual(status & 0x80, 0x80, "busy first: DQ7 = complement of 0x55's bit 7")
+        self._settle()
+        self.assertEqual(self.m.read(BLOCK_8K_A, 1), b"\x00",
+                         "then memory again, holding the AND -- no reset needed")
+
+        self._program(BLOCK_8K_A + 1, 0x5A)
+        self._program(BLOCK_8K_A + 1, 0xFF)    # asking 0x5A back up to 0xFF
+        self.assertEqual(self.m.read(BLOCK_8K_A + 1, 1), b"\x5A",
+                         "the byte is untouched and the chip is memory again")
 
     def test_running_FROM_a_busy_chip_is_reported(self) -> None:
         """⛔ The finding that names the whole class of bug.

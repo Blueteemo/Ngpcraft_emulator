@@ -263,6 +263,19 @@ def run(args: list[str], app) -> int:
     state = {"phase": "booting", "started": None, "f0": 0, "last_f": 0, "last_t": None,
              "ended": None, "code": 1}
 
+    # Every way a cartridge trade ends goes through _end_mirror_bringup: close=False
+    # when a session takes the transport over, close=True when it failed. Watching the
+    # timer alone missed a trade that started and failed between two ticks.
+    real_end = w._end_mirror_bringup
+
+    def end_spy(close: bool = True):
+        x = w._mirror_boot
+        if x is not None and close:
+            state["traded"] = True
+            state["trade_failed"] = x.failed or "closed"
+        real_end(close)
+    w._end_mirror_bringup = end_spy
+
     def finish(why: str, code: int):
         if state["ended"]:
             return
@@ -293,6 +306,24 @@ def run(args: list[str], app) -> int:
             emit({"type": "connecting", "to": connect or f"port {port}"})
             (w._join_mirror if role == "join" else w._host_mirror)()
         elif state["phase"] == "connecting":
+            x = getattr(w, "_mirror_boot", None)
+            if x is not None and now - state.get("last_trade", 0) >= 1.0:
+                state["last_trade"] = now
+                up, down = x.progress
+                emit({"type": "trade", "up": round(up, 3), "down": round(down, 3),
+                      "sent": x._sent, "of": len(x._out), "received": len(x._in),
+                      "want": x._want, "failed": x.failed})
+            # A trade that started and is gone without a match is a failed one: the
+            # shell clears it itself (_end_mirror_bringup), so look for the absence.
+            # Nothing more will happen, and waiting out --wait burns a remote
+            # machine's minutes for nothing.
+            if x is not None:
+                state["traded"] = True
+                state["trade_failed"] = x.failed
+            elif state.get("traded") and m is None:
+                finish("trade_failed: " + str(state.get("trade_failed")
+                                              or (flashes[-1] if flashes else "?")), 6)
+                return
             if m is not None:
                 state.update(phase="playing", started=now, f0=m.frame, last_t=now,
                              last_f=m.frame)

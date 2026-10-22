@@ -739,7 +739,10 @@ class CartExchange:
         lost = getattr(self.pipe, "lost", None)
         if lost:
             self.failed = str(lost)
-            netlog.log("mirror_trade_lost", greeted=self.greeted, why=self.failed)
+            netlog.log("mirror_trade_lost", greeted=self.greeted, why=self.failed,
+                       sent=self._sent, of=len(self._out), pending=_pending(self.pipe),
+                       received=len(self._in), want=self._want,
+                       after_s=round(time.monotonic() - self._t0, 1))
             return
         # CONNECTED, BUT NOBODY SPEAKS MIRROR AT THE OTHER END. A peer that chose the
         # CABLE mode relays serial bytes only when its game sends some -- on a menu that
