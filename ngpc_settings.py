@@ -491,6 +491,12 @@ def soft_patching(s: QSettings) -> bool:
     return bool(s.value("general/soft_patching", True, type=bool))
 
 
+def check_updates(s: QSettings) -> bool:
+    # Default ON: one quiet request to GitHub at most once a day (ngpc_update). The
+    # point of the feature is that players hear of a release without going to look.
+    return bool(s.value("general/check_updates", True, type=bool))
+
+
 def cart_wait_states(s: QSettings) -> bool:
     # Default ON: model the slow cartridge flash. Every instruction is fetched
     # from the cart and data tables are read from it, and that bus is slow. With

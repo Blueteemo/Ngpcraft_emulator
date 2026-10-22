@@ -38,6 +38,9 @@ Android sources are maintained separately; this repository contains its installa
   with a direction toggle), **favourites** ★ and a **never-played** filter. Play count,
   playtime and last-played are tracked per game. Covers are rendered from the game itself,
   or [pick your own](#your-own-cover-art) — one that updates never overwrite.
+- **Updates from inside the app** — *Settings ▸ General ▸ Check for updates*, plus a quiet
+  check at startup. On Windows and Linux one click downloads the new release, installs it
+  and restarts; see [Staying up to date](#staying-up-to-date).
 - **No BIOS needed** — the built-in clean-room HLE image runs the games, **and drives the
   saves, the link cable and the clock**. A real dump stays optional, for the boot animation,
   the console's setup screens, and certainty — see [Games & BIOS](#games--bios).
@@ -172,6 +175,30 @@ workflow exists.
 
 > The macOS app is **not code-signed**, so Gatekeeper warns the first time: right-click ▸
 > **Open** to run it anyway.
+
+### Staying up to date
+
+No need to come back to the Releases page: **Settings ▸ General ▸ Check for updates**
+asks GitHub for the latest release and tells you whether there is a newer one.
+
+- **Windows and Linux**: *Install and restart* downloads that release's archive, replaces
+  the program and starts the new version. Saying *no* to the restart is fine: the update is
+  then installed when you close the emulator.
+- **macOS**: the button opens the download page instead. The app is not signed, and macOS
+  treats an app replaced behind its back worse than one you downloaded yourself.
+- **At startup** the emulator checks by itself, at most once a day, and never opens a window
+  over a game you are playing (the Settings page says it instead). Untick *Check for
+  updates at startup* to turn this off; *Skip this version* silences one release.
+- **Your data is kept**: only the program file is replaced. Saves, save states, settings,
+  covers and the library sit in folders next to it and are not touched.
+- If the emulator is installed in a folder it cannot write to (`Program Files`), it says so
+  and opens the download page instead.
+
+This works from **v3.10.0** on: older versions do not know their own number, so updating
+*to* 3.10.0 is still a manual download, the last one. A build made from source or with
+`build_exe.bat` reports itself as `dev` and never offers to replace itself; only the
+tagged builds made by the CI carry a version number (written by `build.yml` before
+packaging, into `ngpc_version.py`).
 
 To build it yourself on the platform you are on:
 

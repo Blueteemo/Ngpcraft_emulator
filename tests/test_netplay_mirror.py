@@ -836,7 +836,8 @@ def test_two_mirrored_pcs_stay_identical_and_keep_full_speed(wire_delay):
 
 @pytest.mark.skipif(not (BIOS.exists() and ROM.exists()),
                     reason="needs the retail bios.bin (gitignored) and the probe ROM")
-def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app):
+@pytest.mark.parametrize("case", ["plain", "boot_bios", "saved_since_load"])
+def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app, case):
     """The product path: a real Shell in mirror mode, over a real socket.
 
     ⚡ ONLY ONE Shell here, with the other PC standing in as a plain MirrorSession.
@@ -845,6 +846,11 @@ def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app):
     everything else -- and a test that destabilises the suite is worse than the
     coverage it buys. One shell still exercises every line this mode added to the
     product: _begin_mirror, attach_mirror, _step_mirror and the frame loop.
+
+    The two other cases are the frame-0 desync of 2026-10-22 (real players, every
+    retry): `boot_bios` -- this PC has "Boot BIOS" on, the other one does not, and the
+    setting was never announced; `saved_since_load` -- the game saved after loading,
+    so the image traded was not the one `reset()` puts back on our own console.
     """
     import ngpc_settings as cfg
     from core import native
@@ -854,11 +860,22 @@ def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app):
 
     s1, s2 = socket.socketpair()
     far_a = far_b = None
+    sh._settings.setValue("general/real_bios", case == "boot_bios")
     try:
         sh.play.start(ROM)
+        if case == "saved_since_load":
+            # What a game save + `commit_save` leave: new cells, and `_rom` following
+            # them -- while the machine still resets to the image it was built with.
+            ses = sh.play.session
+            base, size = ses._cart_windows()[-1]
+            blk = bytearray(ses.machine.flash_peek(base + size - 0x2000, 0x2000))
+            blk[:4] = b"SAVE"
+            ses.machine.flash_restore(base + size - 0x2000, bytes(blk))
+            ses._rom = ses._read_cart_image()
         sh.play.held = 0x08                      # this player holds RIGHT
         sh._begin_mirror(SocketPipe(s1), host=True)
         far_trade = _bring_up(sh, s2, sh.play.session._rom)
+        sent = far_trade.peer_image              # what the far PC got from us
         assert sh.play.link_mode() == "mirror"
 
         # The other PC, built the way _begin_mirror builds its pair: same cartridge
@@ -868,7 +885,7 @@ def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app):
         # and given the same wait-state tuning. Hand-rolled NativeMachines desynced
         # inside two frames -- which is the design's own warning, working.
         def far_console():
-            return NativeSession(ROM, rom_bytes=sh.play.session._rom, autosave=False,
+            return NativeSession(ROM, rom_bytes=sent, autosave=False,
                                  bios_path=BIOS, save_to_rom=False, sidecar=False,
                                  flash_size=sh.play.session.machine.flash_capacity())
         far_a, far_b = far_console(), far_console()
@@ -906,6 +923,9 @@ def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app):
             far.step(0x01)                       # the other player holds UP
 
         assert near.rejected is None and far.rejected is None
+        # Our console runs the cartridge we SENT, not the one reset() remembers.
+        assert b"".join(sh.play.machine.flash_peek(b, n)
+                        for b, n in sh.play.session._cart_windows()) == sent
         assert near.frames_run > 300, f"the shell barely ran: {near.frames_run}"
         assert near.desync_at is None and far.desync_at is None
         # each console heard the OTHER player's controller byte, on both PCs
@@ -915,6 +935,7 @@ def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app):
         # ...and the two PCs hold the same pair of consoles
         assert near.checksum() == far.checksum()
     finally:
+        sh._settings.remove("general/real_bios")
         # ⚡ Timers before objects: a Shell left holding a running QTimer that fires
         # into a half-collected page takes the process with it (qFatal, no traceback).
         # Sockets first: on Windows a socketpair is two loopback TCP sockets, and one

@@ -66,6 +66,7 @@ import ngpc_library as lib  # noqa: E402
 import ngpc_input  # noqa: E402
 import ngpc_theme  # noqa: E402
 import ngpc_filters  # noqa: E402
+import ngpc_update  # noqa: E402
 
 # Graphics filter plugins: discovered once, from the folder the user pointed at. A
 # module-level registry for the same reason PALETTE is one -- the render path is deep
@@ -1578,6 +1579,7 @@ class SettingsPage(QWidget):
     resume_requested = pyqtSignal()
     scale_changed = pyqtSignal(int)  # window-size preset -> resize the window now
     storage_changed = pyqtSignal()   # settings store swapped (portable <-> registry)
+    update_check_requested = pyqtSignal()   # the "check for updates" button
 
     def __init__(self, settings) -> None:
         super().__init__()
@@ -1720,6 +1722,22 @@ class SettingsPage(QWidget):
         self._portable_hint.setObjectName("hint")
         self._portable_hint.setWordWrap(True)
 
+        # Updates: the button asks now, the box lets the startup ask once a day. The
+        # status line under them is written by the shell (set_update_status), which
+        # owns the request -- this page only has the controls.
+        self._update_btn = QPushButton(); self._update_btn.setObjectName("ghost")
+        self._update_btn.clicked.connect(self.update_check_requested.emit)
+        self._lbl_update = QLabel()
+        self._autoupdate = QCheckBox()
+        self._autoupdate.setChecked(cfg.check_updates(self._settings))
+        self._autoupdate.toggled.connect(
+            lambda b: self._settings.setValue("general/check_updates", b))
+        self._lbl_autoupdate = QLabel()
+        self._update_status = QLabel()
+        self._update_status.setObjectName("hint")
+        self._update_status.setWordWrap(True)
+        self._update_status_key: tuple[str, dict] | None = None
+
         self._rows_general = [
             _row(self._lbl_lang, self._lang),
             _row(self._lbl_theme, self._theme),
@@ -1730,13 +1748,29 @@ class SettingsPage(QWidget):
             _row(self._lbl_runahead, self._runahead_box),
             _row(self._lbl_cartwait, self._cartwait),
             _row(self._lbl_portable, self._portable),
+            _row(self._lbl_update, self._update_btn),
+            _row(self._lbl_autoupdate, self._autoupdate),
         ]
         for r in self._rows_general:
             v.addWidget(r)
         v.addWidget(self._runahead_hint)
         v.addWidget(self._cartwait_hint)
         v.addWidget(self._portable_hint)
+        v.addWidget(self._update_status)
         return w
+
+    def set_update_status(self, key: str | None, **fmt) -> None:
+        """The line under the update button. Kept as a KEY, not a sentence, so a
+        language change re-says it in the new language."""
+        self._update_status_key = (key, fmt) if key else None
+        if key:
+            lang = cfg.language(self._settings)
+            self._update_status.setText(cfg.tr(lang, key).format(**fmt))
+        else:
+            self._update_status.setText("")
+
+    def set_update_busy(self, busy: bool) -> None:
+        self._update_btn.setEnabled(not busy)
 
     def _on_portable_toggled(self, enabled: bool) -> None:
         """Migrate settings to the chosen store and switch to it for this session."""
@@ -2426,6 +2460,11 @@ class SettingsPage(QWidget):
         self._coincell_hint.setText(t("coin_cell_hint"))
         self._lbl_cartwait.setText(t("cart_wait")); self._cartwait_hint.setText(t("cart_wait_hint"))
         self._lbl_portable.setText(t("portable")); self._portable_hint.setText(t("portable_hint"))
+        self._lbl_update.setText(t("update_label").format(version=ngpc_update.display_version()))
+        self._update_btn.setText(t("update_check"))
+        self._lbl_autoupdate.setText(t("update_auto"))
+        if self._update_status_key:
+            self.set_update_status(self._update_status_key[0], **self._update_status_key[1])
         self._lbl_scale.setText(t("lcd_scale")); self._lbl_smooth.setText(t("smoothing"))
         self._lbl_filter.setText(t("filter")); self._lbl_color.setText(t("color_profile"))
         self._lbl_aspect.setText(t("aspect")); self._lbl_fs.setText(t("fullscreen"))
@@ -5959,6 +5998,32 @@ class _Link2PFrame(QMainWindow):
         super().closeEvent(e)
 
 
+class _UpdateHub(QObject):
+    """Where the update threads land. ONE for the whole session, never parented: a
+    request outlives any window it was asked from, and a QObject destroyed under a
+    thread that emits into it kills the process (the lesson of ngpc_lobby's
+    _PublicIPProbe). Windows connect to it; Qt drops the link when they go."""
+    checked = pyqtSignal(object, bool)     # release info, asked by the button?
+    failed = pyqtSignal(str, bool)
+    progress = pyqtSignal(int)             # percent
+    downloaded = pyqtSignal(str)           # archive path
+    download_failed = pyqtSignal(str)      # "" = cancelled
+
+
+_update_hub_obj: _UpdateHub | None = None
+
+
+def _update_hub() -> _UpdateHub:
+    global _update_hub_obj
+    from PyQt6 import sip
+    # Deleted under us when the QApplication it was born in goes away -- measured in
+    # the test suite, where a module tears its application down and the next builds a
+    # new one. Born again in the new one.
+    if _update_hub_obj is None or sip.isdeleted(_update_hub_obj):
+        _update_hub_obj = _UpdateHub()     # created in the GUI thread, no parent
+    return _update_hub_obj
+
+
 class Shell(QMainWindow):
     def __init__(self, rom: str | None = None) -> None:
         super().__init__()
@@ -6018,7 +6083,8 @@ class Shell(QMainWindow):
         rlay.addWidget(self._nav_lib); rlay.addWidget(self._nav_set)
         rlay.addWidget(self._nav_dbg)
         rlay.addStretch()
-        self._ver = QLabel("native core"); self._ver.setObjectName("hint")
+        self._ver = QLabel(f"{ngpc_update.display_version()} · native core")
+        self._ver.setObjectName("hint")
         self._ver.setStyleSheet("padding:8px 12px; font-size:11px;")
         rlay.addWidget(self._ver)
         root.addWidget(rail)
@@ -6075,6 +6141,17 @@ class Shell(QMainWindow):
         self.settings.theme_changed.connect(self._restyle)
         self.settings.resume_requested.connect(lambda: self._go(2))
         self._debug_win = None
+        self._update_busy = False
+        self._update_dialog = None
+        self._staged_exe: Path | None = None     # an update unpacked beside us
+        self._relaunch_exe: Path | None = None   # ...and "restart now" was chosen
+        hub = _update_hub()
+        hub.checked.connect(self._on_update_checked)
+        hub.failed.connect(self._on_update_failed)
+        hub.progress.connect(self._on_update_progress)
+        hub.downloaded.connect(self._on_update_downloaded)
+        hub.download_failed.connect(self._on_update_download_failed)
+        self.settings.update_check_requested.connect(lambda: self._start_update_check(True))
 
         # Follow the OS live: on "system", flipping Windows to light repaints the
         # app immediately rather than at the next launch. Qt 6.5+; harmless if the
@@ -6099,6 +6176,15 @@ class Shell(QMainWindow):
         self._toggle_rail(not bool(self._settings.value("win/rail_collapsed", False, type=bool)))
         self.fit_to_screen()
         self._auto_rail()
+        if getattr(sys, "frozen", False):
+            ngpc_update.cleanup_after_update(Path(sys.executable))
+        if self._startup_update_due():
+            # PARENTED, not QTimer.singleShot (see _show_rewind_bar). A few seconds in,
+            # so the request never competes with the window coming up.
+            self._update_timer = QTimer(self)
+            self._update_timer.setSingleShot(True)
+            self._update_timer.timeout.connect(lambda: self._start_update_check(False))
+            self._update_timer.start(4000)
         if rom:
             self._launch(rom)
 
@@ -6314,6 +6400,176 @@ class Shell(QMainWindow):
         # the in-game options), and the page is one of the inputs to "is the nav hidden
         # for the game?" -- so re-decide it in the one place they all reach.
         self._sync_fullscreen_chrome()
+
+    # ---- updates (ngpc_update) ---------------------------------------------------
+    # Startup check: quiet, a packaged release only, once a day at most. The button
+    # in Settings asks now and always answers. Installing is offered only where the
+    # program can replace itself (ngpc_update.can_self_install); elsewhere the same
+    # dialog opens the release page.
+    UPDATE_EVERY_S = 20 * 3600
+
+    def _startup_update_due(self) -> bool:
+        if not getattr(sys, "frozen", False) or not cfg.check_updates(self._settings):
+            return False
+        if ngpc_update.parse_version(ngpc_update.current_version()) is None:
+            return False                 # a dev build is not a release: nothing to compare
+        last = float(self._settings.value("general/update_last_check", 0) or 0)
+        return time.time() - last >= self.UPDATE_EVERY_S
+
+    def _start_update_check(self, manual: bool) -> None:
+        if self._update_busy:
+            return
+        self._update_busy = True
+        self.settings.set_update_busy(True)
+        if manual:
+            self.settings.set_update_status("update_checking")
+        hub = _update_hub()
+
+        def work() -> None:
+            try:
+                hub.checked.emit(ngpc_update.fetch_latest(), manual)
+            except Exception as exc:  # noqa: BLE001 -- offline is a normal answer
+                hub.failed.emit(str(exc), manual)
+        import threading
+        threading.Thread(target=work, name="update-check", daemon=True).start()
+
+    def _on_update_failed(self, err: str, manual: bool) -> None:
+        self._update_busy = False
+        self.settings.set_update_busy(False)
+        if manual:
+            self.settings.set_update_status("update_check_failed", err=err)
+
+    def _on_update_checked(self, info: dict, manual: bool) -> None:
+        self._update_busy = False
+        self.settings.set_update_busy(False)
+        self._settings.setValue("general/update_last_check", time.time())
+        cur = ngpc_update.current_version()
+        if not ngpc_update.is_newer(info["version"], cur):
+            if ngpc_update.parse_version(cur) is None:
+                self.settings.set_update_status("update_dev", latest=info["version"])
+            elif manual:
+                self.settings.set_update_status("update_none", version=cur)
+            return
+        self.settings.set_update_status("update_available", version=info["version"])
+        if not manual:
+            if self._settings.value("general/update_skip", "") == info["version"]:
+                return
+            if self._stack.currentWidget() is self.play:
+                return                   # never a dialog over a game; Settings says it
+        self._offer_update(info, manual)
+
+    def _offer_update(self, info: dict, manual: bool) -> None:
+        t = lambda k: cfg.tr(cfg.language(self._settings), k)
+        box = QMessageBox(self)
+        box.setWindowTitle(t("update_title"))
+        box.setText(t("update_text").format(new=info["version"],
+                                            cur=ngpc_update.current_version()))
+        if info.get("notes"):
+            box.setDetailedText(ngpc_update.short_notes(info["notes"]))
+        install = None
+        if ngpc_update.can_self_install() and info.get("asset_url"):
+            install = box.addButton(t("update_install"), QMessageBox.ButtonRole.AcceptRole)
+        page = box.addButton(t("update_page"), QMessageBox.ButtonRole.ActionRole)
+        skip = (None if manual else
+                box.addButton(t("update_skip"), QMessageBox.ButtonRole.DestructiveRole))
+        later = box.addButton(t("update_later"), QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(install or page)
+        box.setEscapeButton(later)
+        box.exec()
+        clicked = box.clickedButton()
+        if install is not None and clicked is install:
+            self._download_update(info)
+        elif clicked is page:
+            self._open_url(info.get("page") or ngpc_update.RELEASES_PAGE)
+        elif skip is not None and clicked is skip:
+            self._settings.setValue("general/update_skip", info["version"])
+
+    def _open_url(self, url: str) -> None:
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl(url))
+
+    def _download_update(self, info: dict) -> None:
+        import tempfile
+        import threading
+        from PyQt6.QtWidgets import QProgressDialog
+        t = lambda k: cfg.tr(cfg.language(self._settings), k)
+        self._update_page_url = info.get("page") or ngpc_update.RELEASES_PAGE
+        cancel = threading.Event()
+        dlg = QProgressDialog(t("update_downloading").format(version=info["version"]),
+                              t("update_later"), 0, 100, self)
+        dlg.setWindowTitle(t("update_title"))
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.canceled.connect(cancel.set)
+        dlg.setValue(0)
+        self._update_dialog = dlg
+        hub = _update_hub()
+        dest = Path(tempfile.gettempdir()) / Path(info["asset_url"]).name
+        size = int(info.get("asset_size") or 0)
+        last = [-1]
+
+        def progress(done: int, total: int) -> None:
+            pct = int(done * 100 / (total or size or 1))
+            if pct != last[0]:           # one signal per percent, not per 64 KiB
+                last[0] = pct
+                hub.progress.emit(min(pct, 100))
+
+        def work() -> None:
+            try:
+                ngpc_update.download(info["asset_url"], dest, progress, cancel)
+                hub.downloaded.emit(str(dest))
+            except Exception as exc:  # noqa: BLE001 -- reported, or a cancel
+                hub.download_failed.emit("" if cancel.is_set() else str(exc))
+        threading.Thread(target=work, name="update-download", daemon=True).start()
+
+    def _on_update_progress(self, pct: int) -> None:
+        dlg = getattr(self, "_update_dialog", None)
+        if dlg is not None:
+            dlg.setValue(pct)
+
+    def _close_update_dialog(self) -> None:
+        dlg, self._update_dialog = getattr(self, "_update_dialog", None), None
+        if dlg is not None:
+            dlg.close()
+            dlg.deleteLater()
+
+    def _on_update_download_failed(self, err: str) -> None:
+        self._close_update_dialog()
+        if err:                          # empty = the player cancelled
+            self._update_fallback("update_failed", err=err)
+
+    def _update_fallback(self, key: str, **fmt) -> None:
+        """Could not install: say why, and send the player to the page instead."""
+        t = lambda k: cfg.tr(cfg.language(self._settings), k)
+        QMessageBox.warning(self, t("update_title"), t(key).format(**fmt))
+        self._open_url(getattr(self, "_update_page_url", ngpc_update.RELEASES_PAGE))
+
+    def _on_update_downloaded(self, path: str) -> None:
+        self._close_update_dialog()
+        t = lambda k: cfg.tr(cfg.language(self._settings), k)
+        archive = Path(path)
+        exe = Path(sys.executable)
+        try:
+            ngpc_update.stage(archive, exe)
+        except PermissionError:
+            self._update_fallback("update_no_write", folder=str(exe.parent))
+            return
+        except Exception as exc:  # noqa: BLE001 -- nothing was touched
+            self._update_fallback("update_failed", err=str(exc))
+            return
+        finally:
+            archive.unlink(missing_ok=True)
+        # Ready beside us; main() swaps it in once the window is gone (see
+        # ngpc_update.stage for why not now). Saying no only waits for the close.
+        self._staged_exe = exe
+        self.settings.set_update_status("update_pending")
+        if QMessageBox.question(self, t("update_title"), t("update_installed")) \
+                == QMessageBox.StandardButton.Yes:
+            self._relaunch_exe = exe     # main() starts it once we are fully closed
+            self.close()
+            QApplication.quit()
 
     def _go(self, idx: int) -> None:
         # Leaving the game for a menu SUSPENDS it (paused, still loaded) so the
@@ -6918,7 +7174,8 @@ class Shell(QMainWindow):
             self._settings.setValue("online/mirror_delay", int(d))
         return bool(ok)
 
-    def _mirror_handshake(self, host: bool, delay: int | None = None):
+    def _mirror_handshake(self, host: bool, delay: int | None = None,
+                          image: bytes | None = None):
         """The fingerprint both PCs must agree on, and our own cartridge's.
 
         The cartridge is ANNOUNCED, not compared: the images are traded (see
@@ -6937,7 +7194,8 @@ class Shell(QMainWindow):
         # runs, so it belongs in the fingerprint: two players on different sides of
         # that toggle would drift, and drift is what the handshake exists to refuse.
         return Handshake(
-            rom_hash=hashlib.sha1(page.session._rom).hexdigest()[:16],
+            rom_hash=hashlib.sha1(page.session._rom if image is None
+                                  else image).hexdigest()[:16],
             bios_hash=bios_hash,
             # ...and the SCHEDULE the two consoles are stepped on. core_fingerprint
             # hashes the DLL, so a change to how Python interleaves them would not
@@ -6984,8 +7242,17 @@ class Shell(QMainWindow):
             _close_pipe(pipe)
             self._release_udp_rule()
             return
-        self._mirror_boot = CartExchange(pipe, page.session._rom,
-                                         self._mirror_handshake(host, delay))
+        # ⛔ THE CARTRIDGE AS IT IS NOW, NOT AS IT WAS LOADED. `session._rom` is the
+        # image at load time (or at the last committed save), while `machine.reset()`
+        # puts the flash back to the image the machine was BUILT with: a save made
+        # since then made the console we start here and the copy the peer builds two
+        # different cartridges. Measured 2026-10-22: frame-0 desync, the joiner's
+        # checksum different on every retry. One snapshot, sent AND laid back on our
+        # own console after its reset (`_start_mirror`).
+        image = page.session._read_cart_image()
+        self._mirror_image = image
+        self._mirror_boot = CartExchange(pipe, image,
+                                         self._mirror_handshake(host, delay, image))
         self._mirror_boot_host = host
         page._flash(cfg.tr(cfg.language(self._settings), "mirror_trading"), 60_000)
         self._mirror_timer = QTimer(self)
@@ -7058,7 +7325,7 @@ class Shell(QMainWindow):
         # ⚡ Its cartridge is the one the PEER sent, save and all.
         peer = NativeSession(
             page._rom_path, rom_bytes=peer_image, autosave=False,
-            bios_path=page._bios_path(), real_bios=page._real_bios,
+            bios_path=page._bios_path(), real_bios=False,
             save_to_rom=False, sidecar=False,
             # ⛔ Sized from the IMAGE, and ONLY from the image. The peer's session
             # already padded its cartridge up to its own flash capacity before sending
@@ -7086,10 +7353,26 @@ class Shell(QMainWindow):
         if cfg.cart_wait_states(self._settings):
             peer.machine.set_timing_silicon(cfg.CART_FETCH_WAIT, cfg.CART_BIOS_WAIT)
         clock = native.RtcState(1, *self.MIRROR_CLOCK)
+        # ⛔ ALWAYS THE HAND-OFF BOOT, WHATEVER "Boot BIOS" SAYS. That setting is per PC
+        # and was never announced: a console-boot PC and a hand-off PC simulate two
+        # different machines from frame 0 (measured: 89D577D5 vs A1D8BD87 on the same
+        # cart). And a console boot is not deterministic even when both agree: it reads
+        # this PC's coin cell, and the jump into the cartridge is made by the page's
+        # wall-clock assist on OUR console only. The hand-off is a pure function of the
+        # cartridge, the BIOS and the announced settings.
+        page._real_bios = False
         for m in (page.machine, peer.machine):
             m.set_rtc(clock)
             m.serial_set_enabled(True)      # the cable is in before either boots
-            m.reset(real_bios=page._real_bios, bios_handoff=not page._real_bios)
+            m.reset(real_bios=False, bios_handoff=True)
+        # The reset put OUR flash back to the image this machine was built with; the
+        # peer built its copy from the one we SENT. Make ours that one too.
+        image, self._mirror_image = getattr(self, "_mirror_image", None), None
+        if image is not None:
+            off = 0
+            for base, size in page.session._cart_windows():
+                page.machine.flash_restore(base, image[off:off + size])
+                off += size
         # A console that has just been power-cycled needs the page's own boot
         # bookkeeping cleared with it -- the same things _do_reset clears. Skipping it
         # left the BIOS hand-off assist thinking it had already run, on the console-boot
@@ -7650,7 +7933,22 @@ def main() -> int:
     # AFTER show(): the property store needs a real HWND, which winId only has once the
     # window exists. This is what puts our picture on the taskbar button (see above).
     stamp_taskbar_icon(shell)
-    return app.exec()
+    rc = app.exec()
+    if shell._staged_exe is not None:
+        # An update waits beside us. Swapped in only NOW, window gone: past this line
+        # a first-time import would read the new executable (ngpc_update.stage).
+        try:
+            ngpc_update.swap_in(shell._staged_exe)
+        except OSError:
+            pass                         # the old one is back; next launch tidies up
+        if shell._relaunch_exe is not None:
+            # Stop listening FIRST: the new process would otherwise find us, hand us
+            # its launch and quit.
+            server = getattr(shell, "_instance_server", None)
+            if server is not None:
+                server.close()
+            ngpc_update.relaunch(shell._relaunch_exe)
+    return rc
 
 
 if __name__ == "__main__":

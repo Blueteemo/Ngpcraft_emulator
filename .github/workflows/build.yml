@@ -97,6 +97,15 @@ jobs:
         # dump alone can point at the wrong test. One name per line pins the real one.
         run: pytest -v
 
+      # The binary must know which release it is, or the update check
+      # (ngpc_update.py) has nothing to compare with GitHub's latest tag. Only a TAG
+      # build gets a number: a "Run workflow" build stays "dev", which never offers
+      # to update itself. After the tests, so they always run the committed file.
+      - name: Stamp the version (tag builds)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: printf 'VERSION = "%s"\n' "${GITHUB_REF_NAME#v}" > ngpc_version.py
+
       - name: Package with PyInstaller
         run: pyinstaller --noconfirm --clean NgpCraftEmulator.spec
 

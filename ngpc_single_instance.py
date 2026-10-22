@@ -91,6 +91,10 @@ class InstanceServer(QObject):
     def listening(self) -> bool:
         return self._server.isListening()
 
+    def close(self) -> None:
+        """Stop answering: the process is handing over to a successor (an update)."""
+        self._server.close()
+
     def _accept(self) -> None:
         while self._server.hasPendingConnections():
             sock = self._server.nextPendingConnection()
