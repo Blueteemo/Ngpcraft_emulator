@@ -216,6 +216,7 @@ def run(args: list[str], app) -> int:
         data = src.read_bytes()
         rom_path = f"robot-memory/{src.name}"
         rom_loader.register_memory_rom(rom_path, data)
+    mapping = None
     if _arg(args, "--serve-rom"):
         sp = int(_arg(args, "--serve-rom"))
         from core import upnp
@@ -360,5 +361,14 @@ def run(args: list[str], app) -> int:
         page.stop()
     except Exception:  # noqa: BLE001 -- leaving anyway
         pass
+    try:
+        w.close()                # the shell's own cleanup: its router rule for the match
+    except Exception:  # noqa: BLE001
+        pass
+    if mapping is not None:      # ...and ours, for the cartridge channel
+        try:
+            mapping.close()
+        except Exception:  # noqa: BLE001 -- the box's lease is the net
+            pass
     report.close()
     return state["code"]

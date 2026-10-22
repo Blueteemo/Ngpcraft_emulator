@@ -107,9 +107,12 @@ def test_the_switch_keeps_the_suite_off_the_real_router(monkeypatch):
     assert upnp.open_port(7789) is None
 
 
-def test_the_hosting_worker_closes_the_port_once_someone_is_in(monkeypatch):
-    """The TCP rule lives for the ATTEMPT (a connected peer needs no inbound rule); the
-    UDP one is handed to the shell, which keeps it for the mirror session's datagrams."""
+def test_the_hosting_worker_keeps_the_rule_for_the_session(monkeypatch):
+    """The WHOLE rule -- TCP included -- is handed to the shell, which keeps it for as
+    long as the session runs. It used to delete the TCP rule as soon as the peer was in
+    ("a connected peer needs no inbound rule"): on some boxes that drops the live NAT
+    session, and measured 2026-10-22 against a remote machine nothing but the hellos got
+    through and both PCs saw [WinError 10054] ~20 s later, mid cartridge trade."""
     import ngpc_shell
     from PyQt6.QtCore import Qt
 
@@ -146,8 +149,8 @@ def test_the_hosting_worker_closes_the_port_once_someone_is_in(monkeypatch):
         assert got, "nobody was accepted"
         assert asked == [("TCP", "UDP")]
         assert said == [(True, "203.0.113.7")]
-        assert closed == ["TCP"], "the TCP rule outlived the attempt"
-        assert w.upnp_udp is not None and w.upnp_udp.protocols == ["UDP"],             "the UDP rule was not handed over"
+        assert closed == [], "a rule was closed while the connection is live"
+        assert w.upnp_udp is not None and w.upnp_udp.protocols == ["TCP", "UDP"],             "the rule was not handed over whole"
     finally:
         peer.close()
         for c in got:

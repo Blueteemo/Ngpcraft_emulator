@@ -5716,11 +5716,18 @@ class _NetConnect(QThread):
                         if self._cancel.is_set():
                             break
                         conn, _ = srv.accept()
-                        # The UDP rule outlives the attempt: a mirror session receives
-                        # the peer's datagrams for as long as it runs. The shell closes
-                        # it with the session (`upnp_udp`); the box's lease is the net.
-                        if mapping is not None and "UDP" in mapping.protocols:
-                            mapping.close("TCP")
+                        # ⛔ THE RULE OUTLIVES THE ATTEMPT -- TCP INCLUDED. This used to
+                        # delete the TCP rule the moment the peer was in, on the idea
+                        # that an established connection no longer needs it. On some
+                        # boxes it does: removing the rule also drops the live NAT
+                        # session, so after the first few packets NOTHING got through
+                        # and Windows gave up ~20 s later -- `[WinError 10054]` on both
+                        # PCs, mid cartridge trade. Measured 2026-10-22 with the link
+                        # robot against a GitHub machine: hellos passed, 0 bytes of
+                        # cartridge in 20 s, three times; the same box with the rule
+                        # kept carried whole matches. The shell closes it with the
+                        # session (`upnp_udp`, the name kept); the lease is the net.
+                        if mapping is not None:
                             self.upnp_udp, mapping = mapping, None
                         return conn
                 except OSError:
@@ -6799,7 +6806,15 @@ class Shell(QMainWindow):
                                host=(mode == "host"))
             return
         if udp_rule is not None:
-            udp_rule.close()         # the cable mode has no use for UDP
+            # The cable mode has no use for UDP -- but the TCP rule stays for as long as
+            # the cable does (see _NetConnect._accept: deleting it can cut the live
+            # connection). Released in _end_net_link. A SOAP call can take seconds:
+            # off the Qt thread.
+            import threading
+            threading.Thread(target=udp_rule.close, args=("UDP",), name="upnp-close",
+                             daemon=True).start()
+            self._release_udp_rule()
+            self._udp_rule = udp_rule
         if self.play.machine is None:
             try: sock.close()
             except OSError: pass
@@ -7199,6 +7214,7 @@ class Shell(QMainWindow):
         self.play.net_pending = False
         self._close_host_info()
         self.play.detach_net_link()
+        self._release_udp_rule()      # the box's rule for this link (TCP, kept with it)
 
     def _open_debug(self) -> None:
         if self._debug_win is None:

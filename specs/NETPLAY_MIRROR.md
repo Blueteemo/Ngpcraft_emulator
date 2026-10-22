@@ -402,6 +402,16 @@ TO3's flip-flop parity (`to3_half_periods`, the sound CPU's interrupt clock) and
 core; `tests/test_reset_is_clean.py` forces every aux field and checks the reset. Found
 by the link-test robot (`ngpc_robot.py`), which plays the real shell against itself.
 
+## 8c. The router rule lives as long as the session (2026-10-22)
+
+The host opens its port by UPnP while it waits (core/upnp.py). It used to delete the TCP
+rule as soon as the peer connected; on some routers that drops the live NAT session, and
+after the hellos nothing got through: `[WinError 10054]` on both PCs ~20 s later, mid
+cartridge trade. Measured three times between this PC and a GitHub Windows machine with
+the link-test robots, then a full 90-second match once the rule was kept. The whole
+rule is now handed to the shell and released when the mirror session (or the cable)
+ends.
+
 ## 9. Validation
 
 `tests/test_netplay_mirror.py` — 34 test functions, 36 cases with parametrisation: the

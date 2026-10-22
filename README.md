@@ -646,8 +646,11 @@ player toolbar's **🔗** button:
   already taken, a firewall — instead of an error number.
 
   🔓 **The emulator opens the port on your router by itself (UPnP)** while you host — TCP,
-  and UDP for mirror play — and the host panel tells you whether it could. The rules are
-  removed again once the other player is in (UDP: when the mirror match ends). On a box
+  and UDP for mirror play — and the host panel tells you whether it could. The rules stay
+  for as long as the match or the cable does, and are removed when it ends — TCP
+  included: some boxes cut the live connection when its rule is deleted, which is what
+  made hosting fail with `[WinError 10054]` about 20 seconds in, during the cartridge
+  trade (fixed in 3.10). On a box
   without UPnP, or with it switched off, forward the port by hand as the panel explains
   (TCP **and** UDP, same number). Measured on a common ISP router: a hand-made forward let
   nothing in, the same port opened by UPnP carried a five-minute match. Set
