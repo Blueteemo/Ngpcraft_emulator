@@ -50,6 +50,7 @@ tests drive it with a pair of lists.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import platform
@@ -384,6 +385,9 @@ def open_udp(tcp_sock, host: bool) -> "UdpSide | None":
     return UdpSide(u, peer_ip=peer_ip)
 
 
+_SEND_LATER = {errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOBUFS}
+
+
 class SocketPipe:
     """A TCP socket as a Pipe. Non-blocking, and it never loses a byte.
 
@@ -453,6 +457,13 @@ class SocketPipe:
         except (BlockingIOError, InterruptedError):
             pass                                    # buffer full: keep it, try again
         except OSError as e:
+            # ⛔ macOS SAYS "BUFFER FULL" ANOTHER WAY TOO. A non-blocking send there can
+            # raise ENOBUFS (errno 55) instead of EAGAIN when the socket's buffers are
+            # momentarily exhausted -- loopback especially. Read as a lost link, it
+            # killed the cartridge trade of the two-robot test on the macOS CI only
+            # (2026-10-22, run 50: `trade_failed`, Windows and Linux green).
+            if e.errno in _SEND_LATER:
+                return
             self._lose(str(e))
 
     def send(self, data: bytes) -> None:

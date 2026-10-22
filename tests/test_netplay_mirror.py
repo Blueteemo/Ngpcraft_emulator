@@ -1695,3 +1695,33 @@ def test_a_datagram_without_our_token_is_ignored():
         assert side.recv() == [(5, 0x10), (6, 0x20)]
     finally:
         u.close(); intruder.close()
+
+
+def test_a_full_buffer_reported_as_enobufs_is_not_a_lost_link():
+    """macOS can answer a non-blocking send with ENOBUFS instead of EAGAIN. Taken for a
+    dead link, it killed the cartridge trade on the macOS CI only (2026-10-22)."""
+    import errno
+
+    class _Sock:
+        def __init__(self):
+            self.got, self.fail = bytearray(), 1
+
+        def send(self, data):
+            if self.fail:
+                self.fail -= 1
+                raise OSError(errno.ENOBUFS, "No buffer space available")
+            self.got += data
+            return len(data)
+
+        def setblocking(self, flag):
+            pass
+
+        def close(self):
+            pass
+
+    sock = _Sock()
+    pipe = SocketPipe(sock)
+    pipe.send(b"cartridge")
+    assert pipe.lost is None and pipe.pending == len(b"cartridge")
+    pipe.flush()
+    assert pipe.lost is None and bytes(sock.got) == b"cartridge" and pipe.pending == 0

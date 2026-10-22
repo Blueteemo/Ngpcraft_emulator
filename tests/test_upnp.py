@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from core import upnp
@@ -143,7 +144,17 @@ def test_the_hosting_worker_keeps_the_rule_for_the_session(monkeypatch):
     got = []
     t = threading.Thread(target=lambda: got.append(w._accept()), daemon=True)
     t.start()
-    peer = socket.create_connection(("127.0.0.1", port), timeout=5)
+    # The worker listens only once its (fake) box has answered. Windows retries a
+    # refused SYN for ~2 s and hid that; macOS refuses at once (CI run 50).
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            peer = socket.create_connection(("127.0.0.1", port), timeout=5)
+            break
+        except ConnectionRefusedError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
     t.join(5)
     try:
         assert got, "nobody was accepted"

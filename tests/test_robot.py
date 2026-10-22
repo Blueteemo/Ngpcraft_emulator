@@ -66,7 +66,13 @@ def test_two_real_emulators_play_a_mirror_match(tmp_path):
                   "--rom-from", f"127.0.0.1:{rom_port}", "--token", "t0k3n",
                   "--seconds", "4", "--wait", "60", out=tmp_path / "join")
     try:
-        assert join.wait(120) == 0 and host.wait(120) == 0
+        codes = (join.wait(120), host.wait(120))
+        if codes != (0, 0):
+            # The robots' own reports, or a CI failure says only "6 != 0".
+            tails = {side: (tmp_path / side / f).read_text(encoding="utf-8")[-3000:]
+                     for side in ("host", "join") for f in ("robot.jsonl", "netplay.log")
+                     if (tmp_path / side / f).exists()}
+            pytest.fail(f"robot exit codes (join, host) = {codes}\n{tails}")
     finally:
         for p in (host, join):
             if p.poll() is None:
