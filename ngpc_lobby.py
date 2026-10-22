@@ -102,21 +102,45 @@ class _PublicIPProbe(QObject):
     fiche disparait -- une reponse tardive ne tombe alors sur personne.
     """
     got = pyqtSignal(str)
+    others = pyqtSignal(list)       # `_other_local_ips`, meme regle (voir plus bas)
 
 
 _probe_hub: _PublicIPProbe | None = None
 
 
-def _start_public_ip_probe(slot) -> None:
-    """Lance la recherche d'IP publique; `slot` recoit la reponse dans le fil Qt."""
-    import threading
+def _hub() -> _PublicIPProbe:
     global _probe_hub
     if _probe_hub is None:
         _probe_hub = _PublicIPProbe()          # cree dans le fil principal, sans parent
-    hub = _probe_hub
+    return _probe_hub
+
+
+def _start_public_ip_probe(slot) -> None:
+    """Lance la recherche d'IP publique; `slot` recoit la reponse dans le fil Qt."""
+    import threading
+    hub = _hub()
     hub.got.connect(slot)
     threading.Thread(target=lambda: hub.got.emit(_public_ip()),
                      name="public-ip", daemon=True).start()
+
+
+def _start_other_ips_probe(primary: str, slot) -> None:
+    """`_other_local_ips(primary)` hors du fil Qt; `slot` recoit la liste dans le fil Qt.
+
+    ⛔ RESOUDRE LE NOM DU PC PEUT BLOQUER 30 s, et dans le fil Qt cela gelait l'hote.
+    `getaddrinfo(gethostname())` passe sur macOS par la resolution `.local` (mDNS); sur
+    le runner macOS de la CI elle a mis ~35 s. La fiche etant construite dans le fil
+    principal, la connexion du pair -- deja acceptee par le fil d'ecoute -- attendait
+    derriere: le rejoignant abandonnait au bout de HELLO_TIMEOUT (20 s) faute de
+    bonjour, et l'hote ecrivait ensuite dans une socket fermee (`Broken pipe`).
+    test_robot.py, run CI du 2026-10-22: `mirror_no_hello` cote join, `connected` 35 s
+    apres `connect_start` cote hote.
+    """
+    import threading
+    hub = _hub()
+    hub.others.connect(slot)
+    threading.Thread(target=lambda: hub.others.emit(_other_local_ips(primary)),
+                     name="local-ips", daemon=True).start()
 
 
 class HostInfoDialog(QDialog):
@@ -149,12 +173,11 @@ class HostInfoDialog(QDialog):
         h.setTextFormat(Qt.TextFormat.RichText)
         v.addWidget(h)
         v.addWidget(QLabel(self._t("host_lan").format(addr=f"{lan}:{port}")))
-        others = _other_local_ips(lan)
-        if others:
-            alt = QLabel(self._t("host_other_addrs").format(
-                addrs=", ".join(f"{ip}:{port}" for ip in others[:4])))
-            alt.setWordWrap(True)
-            v.addWidget(alt)
+        # Filled by `_on_other_ips`, off the Qt thread (see _start_other_ips_probe).
+        self._alt_lbl = QLabel()
+        self._alt_lbl.setWordWrap(True)
+        self._alt_lbl.hide()
+        v.addWidget(self._alt_lbl)
         self._pub_lbl = QLabel(self._t("host_wan_detecting"))
         self._pub_lbl.setTextFormat(Qt.TextFormat.RichText)
         v.addWidget(self._pub_lbl)
@@ -181,6 +204,7 @@ class HostInfoDialog(QDialog):
         v.addWidget(close)
 
         _start_public_ip_probe(self._on_public_ip)
+        _start_other_ips_probe(lan, self._on_other_ips)
 
     def _t(self, key: str) -> str:
         return cfg.tr(self._lang, key)
@@ -198,6 +222,13 @@ class HostInfoDialog(QDialog):
             self._paste.setText(self._line(ip))
         else:
             self._pub_lbl.setText(self._t("host_wan_none"))
+
+    @pyqtSlot(list)
+    def _on_other_ips(self, others: list) -> None:
+        if others:
+            self._alt_lbl.setText(self._t("host_other_addrs").format(
+                addrs=", ".join(f"{ip}:{self._port}" for ip in others[:4])))
+            self._alt_lbl.show()
 
     def set_upnp(self, opened: bool, external_ip: str = "") -> None:
         """What the box said when asked to open the port. When it did, the manual
