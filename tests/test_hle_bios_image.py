@@ -53,6 +53,16 @@ class HleBiosImageStructure(unittest.TestCase):
             tgt = _u32(self.img, (0xFFFE00 - 0xFF0000) + idx * 4)
             self.assertGreaterEqual(tgt & 0xFFFFFF, 0xFF0000, f"syscall {idx:#x} stub must be in BIOS ROM")
 
+    def test_flash_syscalls_mask_interrupts(self):
+        # While the chip is busy the whole chip answers status, and the game's code
+        # lives on it: an IRQ taken mid-erase runs status bytes (Rogue Aces froze on
+        # its character screen). Each flash stub must open with `push sr; ei 7`.
+        for idx in (0x06, 0x07, 0x08, 0x0D):
+            tgt = _u32(self.img, (0xFFFE00 - 0xFF0000) + idx * 4) & 0xFFFFFF
+            head = self.img[tgt - 0xFF0000:tgt - 0xFF0000 + 3]
+            self.assertEqual(head, bytes([0x02, 0x06, 0x07]),
+                             f"syscall {idx:#x} must run at IFF 7 (push sr; ei 7)")
+
 
 @unittest.skipUnless(_NATIVE and IMAGE.exists(), "native core or image unavailable")
 class HleBiosBoots(unittest.TestCase):
