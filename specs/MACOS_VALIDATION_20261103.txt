@@ -1,0 +1,165 @@
+macOS packaging and Finder integration investigation — 2026-11-03
+
+Scope
+Upstream issue: https://github.com/Tixul/Ngpcraft_emulator/issues/30
+Upstream main baseline: c79605f16aa303ac6e5bf190dbcfca78ae5e14c3
+Initial fork experiment: 9d5224c6561b7585b5f7566c3b0fedea7e2a6593
+Branch: fix/macos-onedir-startup-20261103
+No upstream PR, merge, tag, release upload, or formal-version change.
+
+Environment and provenance
+Real Apple Silicon Mac, arm64, macOS 27.0.1 (26A434).
+Official baseline: upstream v3.13 NgpCraftEmulator-macos.zip, arm64.
+Initial candidate CI: https://github.com/Blueteemo/Ngpcraft_emulator/actions/runs/41632007892
+That CI targets arm64, uses Python 3.11.9, and succeeded at 9d5224c.
+The downloaded CI app was actually launched on this Mac (1.91 s first local
+launch, 1.36 s in a later run with Dock AX sampling).
+Local builds: CPython 3.11.18, PyInstaller 6.22.3, Qt/PyQt6 6.12.0,
+Pillow 13.0.0, AppleClang 21. Native core built from the same upstream baseline.
+Dependencies are in a task-local venv; no system Python replacement.
+The app executable and native core are both Mach-O arm64. No Intel/universal2
+acceptance claim; a universal build needs matching Python, Qt and core slices.
+
+Measured startup
+NSWorkspace launches the .app through LaunchServices. A 50 ms sampler observes
+the first on-screen window >300x200 belonging to that app's registered process.
+Blank library window, isolated portable settings, update checks disabled, no ROM.
+Each run follows graceful window closure and process exit. Runs were alternated.
+These are repeated launches with warm filesystem caches, NOT reboot/purged-cache
+cold launches. No Windows measurements were collected.
+
+                     run 1     run 2     run 3     median
+Official v3.13       12.105 s  12.855 s  12.355 s  12.355 s
+Local 9d5224 onedir   1.754 s   1.154 s   1.055 s   1.154 s
+
+The approximately 10.7x difference is an end-to-end observation, not an isolated
+bootloader-only benchmark. Local Python builds differ from the official runner.
+A later run WITH Dock accessibility sampling measured 16.16 s official, 1.36 s
+downloaded CI onedir, and 1.26 s initial Finder candidate. Do not combine that
+more heavily instrumented run with the three-run table.
+Early probes with incorrect window decoding, a reused process, or concurrent
+desktop app launches were rejected. Their raw files are not acceptance results.
+
+Startup and Dock diagnosis
+Confirmed in source and actual processes: onefile uses a launcher parent plus
+the Python child, extracts dependencies into a fresh temporary _MEI directory,
+and loads Python/Qt there. Onedir uses one process and the installed Frameworks
+and Resources trees. A process sample of v3.13 resolved Python, Qt and SDL from
+the temporary extraction directory. This is strong evidence that unpacking and
+startup loading contribute materially to the delay, consistent with PyInstaller
+documentation. It does not quantify how much is decompression vs OS scanning.
+
+The official app's plist points to icon-windowed.icns (PyInstaller artwork).
+The source spec gates a missing assets/icone_ngpcraft.icns to None. Later Qt
+setWindowIcon uses the actual assets/icone_ngpcraft.ico. A captured launcher icon
+was the PyInstaller logo. Candidate bundle icon is converted from that existing
+official ICO and Finder displays it correctly; no AI artwork was used.
+
+The parent/child handoff and different bundle/runtime icons explain a plausible
+mechanism for the reported Dock transition. However, valid 50 ms Dock AX samples
+did not reproduce two simultaneously RUNNING NgpCraft Dock items in this session.
+Both candidates had a maximum of one running Dock item. Recent, non-running Dock
+items and simultaneous test installs must not be counted as duplicate live icons.
+Thus the full reported visual transient is NOT proven entirely packaging-caused,
+nor accepted as universally fixed. Physical Cmd-Tab and Dock-animation acceptance
+on a clean login/first launch remains outstanding.
+
+Finder implementation and icon design
+QApplication subclass initializes its pending queue BEFORE Qt's constructor.
+It accepts local existing .ngp/.ngc QFileOpenEvents, including early events, and
+defers dispatch until Shell and its instance server exist. Reentrant native event
+loops cannot recursively switch ROMs. Later explicit opens are not deduplicated.
+Use the existing open_from_another_launch path: it handles foreground activation,
+outgoing save commits, and confirmation before ending active link sessions.
+Command-line socket forwarding is retained. argv_emulation remains False.
+
+There are separate Viewer document entries for ngp and ngc, rank Alternate.
+Names: Neo Geo Pocket ROM and Neo Geo Pocket Color ROM.
+The final design intentionally mirrors installed melonDS 1.1: extension-based
+CFBundleDocumentTypes, NO custom document icon and NO private UTI declaration.
+macOS itself composes the folded-corner document, native shadow, official app
+badge, and NGP/NGC labels. The earlier hand-drawn ROM document icon was rejected
+and removed. Native NSWorkspace icon output was visually inspected for both
+extensions and compared with the local melonDS-associated NDS file icon.
+
+No LSSetDefaultRoleHandler, default-app setter, or global association reset was
+called. LaunchServices may select this app when it is the only available viewer;
+Alternate does not guarantee an unassociated file will remain unassociated.
+This Mac had no explicit NGP/NGC override in LSHandlers at inspection time.
+Preservation of an existing OTHER emulator preference still needs a test on a
+machine with such a preference. Only task-owned test apps were re-registered.
+
+Actual file opening tests
+Initial Finder candidate received real LaunchServices Open With events both when
+not running (.ngc, Unicode + spaces) and already running (.ngp). Real game video
+was captured, with bundled HLE BIOS and the native core.
+Finder UI selection + Cmd-O was then exercised for both cold app opening and a
+running-app switch; library play counts advanced and the running switch retained
+the same PID and one window. Settings and play history survived app restarts.
+The final native-icon package also passed actual Finder selection + Cmd-O:
+NGC launches into the native app, then NGP switches within PID 71509 and one
+window. Save-directory and cover-directory preservation sentinels stayed intact.
+The two extension test files contained copies of the same local game, not two
+different cartridge hardware types. The original file's SHA-256 was unchanged.
+No ROM or proprietary BIOS is included in this branch or candidate archive.
+Physical Dock drag, mouse double-click timing, link-session interruption, retail
+BIOS setup and an actual in-game save-slot operation are not yet accepted.
+
+Persistence and update audit
+User paths remain unchanged by this patch:
+  REPO = resolved executable parent (inside .app/Contents/MacOS when packaged).
+  roms, bios.bin, mono BIOS names, thumbnails, covers, library.json and other
+  writable UI folders remain based there; native saves, system.ram and system.rtc
+  also remain there. Portable config.ini and settings backups use that parent;
+  normal QSettings still uses NgpCraft/Emulator. NGPCRAFT_SETTINGS can isolate it.
+Read-only ICO, languages and clean-room HLE BIOS use _MEIPASS; native core is at
+_MEIPASS/cpp/build/ngpc_core.dylib. Onedir's Frameworks/Resources links support
+these same resource lookups. Nothing moves user data into an extraction folder.
+
+IMPORTANT EXISTING RELEASE RISK: writing into the application bundle conflicts
+with read-only installs, App Translocation, signed resource seals and replacing
+the whole .app during manual updates. A package replacement can discard data
+already saved inside Contents/MacOS. This patch preserves existing paths but does
+NOT solve that historical design issue. Never replace a user's app without first
+preserving its writable data and portable config. A separate migration design
+must support legacy discovery, verified copies and rollback before moving data
+to Application Support. No automatic migration/deletion was introduced here.
+
+macOS self-install is already disabled by ngpc_update.can_self_install; this
+change retains it. Archive distribution must preserve symlinks (ditto is used).
+Fresh candidate passed codesign --verify --deep --strict. Signature is ad hoc,
+TeamIdentifier absent; not Developer ID signed or notarized. Local spctl says
+accepted with 'override=security disabled', so it is NOT evidence that Gatekeeper
+first-run checks will pass on another Mac. No Gatekeeper setting was changed.
+CFBundleShortVersionString remains the inherited 0.0.0; real release version
+metadata and minimum supported OS policy remain separate release work.
+
+Tests
+Focused: 42 passed, 3 skipped, 4 subtests passed.
+Includes early/later/reentrant open queue, Unicode paths, invalid URLs, single
+instance routing, persistence, sidecar mode, settings backup, updater and HLE.
+PyQt6 protects QFileOpenEvent construction, so the queue unit test models its
+public URL contract with QEvent; real OS events are covered by desktop tests.
+Full suite: 2148 passed, 170 skipped, 1 failed, 1207 subtests passed (85.92 s).
+Failure: test_link_direct_connect::test_a_name_that_does_not_resolve_fails_at_once.
+System resolver returns 198.18.0.7 for no.such.host.invalid, and the fake-IP proxy
+accepts a socket rather than returning the expected DNS error. The EXACT same
+failure was reproduced in an unmodified git archive of upstream c79605f, using
+the same venv and locally built core. No proxy/DNS setting was changed and no
+unrelated product/test change was made to hide this environmental failure.
+
+Suggested eventual PRs (none opened)
+1. macOS onedir packaging and reuse of the official app icon, plus bundle checks.
+2. Finder document declarations and queued QFileOpenEvent handling, native NGP/NGC
+   file icons, plus focused event and real desktop opening validation.
+3. Separately designed persistence/update/signing work, with verified legacy-data
+   migration and read-only/translocation tests. This deserves a release gate.
+Remove the fork-only preview workflow, validation probe and personal experiment
+report from the eventual upstream code PRs unless maintainers request them.
+
+References
+https://pyinstaller.org/en/stable/usage.html#building-macos-app-bundles
+https://pyinstaller.org/en/stable/feature-notes.html#macos-event-forwarding-and-argv-emulation-in-app-bundles
+https://doc.qt.io/qt-6/qfileopenevent.html
+https://github.com/melonDS-emu/melonDS/blob/master/res/melon.plist.in
+https://github.com/melonDS-emu/melonDS/blob/master/src/frontend/qt_sdl/main.cpp
