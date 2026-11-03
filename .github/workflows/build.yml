@@ -1,49 +1,46 @@
-name: Windows PR3 lifecycle audit
+name: Windows PR3 lifetime confirmation
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  compare:
+  confirm:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
-          path: audit
+          ref: ddc69b2ef590d72003bd1caed991058b486e0824
       - uses: actions/checkout@v4
         with:
-          ref: ddc69b2ef590d72003bd1caed991058b486e0824
-          path: candidate
+          path: .audit
       - uses: actions/checkout@v4
         with:
           ref: 052bd4bd7e2ea4fc7bc953a3d904da8a51e83820
-          path: baseline
+          path: .baseline
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11.9'
-      - name: Install identical pinned diagnostic environment
+      - name: Install matching pinned environment
         run: |
           python -m pip install pip==26.3
-          pip install -r candidate/requirements.txt pytest==9.2.0 pyinstaller==6.22.3 PyQt6==6.12.0 PyQt6-Qt6==6.12.0 PyQt6-sip==13.13.0
+          pip install -r requirements.txt pytest==9.2.0 pyinstaller==6.22.3 PyQt6==6.12.0 PyQt6-Qt6==6.12.0 PyQt6-sip==13.13.0
           python -m pip freeze
-      - name: Build identical native core
+      - name: Build unchanged native core once
         shell: pwsh
         run: |
-          $candidateTree = git -C candidate rev-parse HEAD:cpp
-          $baselineTree = git -C baseline rev-parse HEAD:cpp
-          if ($candidateTree -ne $baselineTree) { throw 'Native core sources differ' }
-          cmake -S baseline/cpp -B baseline/cpp/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build baseline/cpp/build --config Release
-          Copy-Item baseline/cpp/build/Release/ngpc_core.dll baseline/cpp/build/ngpc_core.dll
-          New-Item -ItemType Directory -Force candidate/cpp/build
-          Copy-Item baseline/cpp/build/ngpc_core.dll candidate/cpp/build/ngpc_core.dll
-      - name: Ordered Windows reproduction and baseline comparison
-        env:
-          PYTHONPATH: '${{ github.workspace }}/audit/tools'
-        run: python audit/tools/windows_pr3_audit.py
+          $oldTree = git rev-parse HEAD:cpp
+          $baseTree = git -C .baseline rev-parse HEAD:cpp
+          if ($oldTree -ne $baseTree) { throw 'Native sources differ' }
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build cpp/build --config Release
+          Copy-Item cpp/build/Release/ngpc_core.dll cpp/build/ngpc_core.dll
+          New-Item -ItemType Directory -Force .baseline/cpp/build
+          Copy-Item cpp/build/ngpc_core.dll .baseline/cpp/build/ngpc_core.dll
+      - name: Native GC reproduction and repeated complete fixed suites
+        run: python .audit/tools/windows_pr3_confirm.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-pr3-lifecycle
+          name: windows-pr3-lifetime-confirmation
           path: diagnostics/
