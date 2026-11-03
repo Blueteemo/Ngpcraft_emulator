@@ -31,17 +31,15 @@ jobs:
       fail-fast: false      # one OS failing must not cancel the other two
       matrix:
         include:
-          - os: windows-latest
-            asset: NgpCraftEmulator-windows.zip
-          - os: ubuntu-latest
-            asset: NgpCraftEmulator-linux.tar.gz
-          - os: macos-latest
+          - os: macos-15-intel
             asset: NgpCraftEmulator-macos.zip
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 16b243f26b7404ac5855e1ef7d8ecc1c76b58e92
 
       - uses: actions/setup-python@v5
         with:
