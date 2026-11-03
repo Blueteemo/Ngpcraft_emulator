@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 16b243f26b7404ac5855e1ef7d8ecc1c76b58e92
+          ref: 79d7cc15be716d1524c68b793b9a0dafb8127652
 
       - uses: actions/setup-python@v5
         with:
