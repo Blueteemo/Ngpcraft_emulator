@@ -102,8 +102,21 @@ window. Save-directory and cover-directory preservation sentinels stayed intact.
 The two extension test files contained copies of the same local game, not two
 different cartridge hardware types. The original file's SHA-256 was unchanged.
 No ROM or proprietary BIOS is included in this branch or candidate archive.
-Physical Dock drag, mouse double-click timing, link-session interruption, retail
-BIOS setup and an actual in-game save-slot operation are not yet accepted.
+Additional actual-pointer desktop checks after the source commit:
+  * Double-clicking the NGP icon in Finder loaded it in the existing app (play
+    count advanced to 2).
+  * Dragging the NGC file icon onto the RUNNING Dock application icon loaded it
+    (play count advanced to 2, one app window). The first drag attempt used stale
+    Dock coordinates and did not load; reacquiring the live Dock AX frame after
+    hover and then dropping succeeded. This was an input-targeting failure, not
+    evidence of a rejected QFileOpenEvent.
+  * Save/cover preservation sentinels remained intact after both checks.
+Cold-app Dock drag, repeated rapid double-click timing, link-session interruption,
+retail BIOS setup and an actual in-game save-slot operation are not yet accepted.
+Source CI at 23280330af09c94871763dd9d0b454b425c1a46c:
+https://github.com/Blueteemo/Ngpcraft_emulator/actions/runs/41641707853
+Still queued at final read-back; local build/tests above have completed. This
+record update changes no product code and deliberately does not queue another CI.
 
 Persistence and update audit
 User paths remain unchanged by this patch:
