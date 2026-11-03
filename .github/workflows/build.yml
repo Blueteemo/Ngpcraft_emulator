@@ -106,8 +106,25 @@ jobs:
         shell: bash
         run: printf 'VERSION = "%s"\n' "${GITHUB_REF_NAME#v}" > ngpc_version.py
 
+      - name: Install macOS icon conversion support
+        if: runner.os == 'macOS'
+        run: python -m pip install Pillow
+
       - name: Package with PyInstaller
         run: pyinstaller --noconfirm --clean NgpCraftEmulator.spec
+
+      - name: Inspect packaged macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app='dist/NgpCraftEmulator.app'
+          test -x "$app/Contents/MacOS/NgpCraftEmulator"
+          test -d "$app/Contents/Frameworks"
+          test -e "$app/Contents/Resources/hle_bios/bios_hle.bin"
+          echo "Architecture: $(file "$app/Contents/MacOS/NgpCraftEmulator")"
+          echo 'Bundle icon:'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist"
+          du -sh "$app"
 
       # One clean archive per OS, so a Release carries exactly three downloads.
       # Each is made ON its own runner, which matters most for macOS: the build is
